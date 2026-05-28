@@ -17,7 +17,7 @@ import (
 
 	"github.com/nguyenzung/relayer-server/internal/core"
 	"github.com/nguyenzung/relayer-server/internal/network"
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // Server wraps HTTP server and relayer and exposes monitoring endpoints.
@@ -101,7 +101,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ws accept error: %v", err)
 		return
 	}
-	// nhooyr Conn supports SetReadLimit directly
+	// coder/websocket Conn supports SetReadLimit directly
 	const readLimit = 512 * 1024
 	conn.SetReadLimit(readLimit)
 
