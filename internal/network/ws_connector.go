@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"github.com/nguyenzung/relayer-server/internal/core"
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
-// WSConnector implements core.Connector using nhooyr websocket.
+// WSConnector implements core.Connector using coder/websocket.
 type WSConnector struct {
 	conn     *websocket.Conn
 	pubKey   [32]byte
