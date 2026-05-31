@@ -18,8 +18,12 @@ CLIENT_BIN=bin/client
 LOADTEST_BIN=bin/loadtest
 PKG=./...
 
-.PHONY: all build client loadtest stress run start test fmt vet lint deps clean churntest churn
+.PHONY: all build client loadtest stress run start test fmt vet lint deps clean churntest churn metrics
 all: build
+
+metrics:
+	@echo "Starting metrics collection..."
+	./scripts/collect_metrics.sh
 
 build: deps | bin
 	@echo "Building $(BINARY)..."

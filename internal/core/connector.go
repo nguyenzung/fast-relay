@@ -7,6 +7,6 @@ package core
 
 type Connector interface {
 	ID() [32]byte
-	SafePush(msg Message) bool
+	SafePush(msg OutMessage) bool
 	Close()
 }

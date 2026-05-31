@@ -1,6 +1,9 @@
 package core
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"time"
+)
 
 // Message is a zero-copy byte slice view of the raw network buffer.
 // Layout: [FromID:32][ToIDsLen:1][ToIDs:N*32][DataLen:4][Payload:M]
@@ -70,4 +73,9 @@ func (m Message) ZeroToIDs() {
 			targetArea[i] = 0
 		}
 	}
+}
+
+type OutMessage struct {
+	Msg      Message
+	RecvTime time.Time
 }
