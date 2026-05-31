@@ -5,29 +5,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nguyenzung/relayer-server/internal/core"
 	"github.com/coder/websocket"
+	"github.com/nguyenzung/relayer-server/internal/core"
 )
 
 // WSConnector implements core.Connector using coder/websocket.
 type WSConnector struct {
 	conn     *websocket.Conn
 	pubKey   [32]byte
-	outChan  chan core.Message // Pass by value (slice header) to avoid heap escapes
+	outChan  chan core.OutMessage // Pass by value (slice header) to avoid heap escapes
 	isClosed bool
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	relayer  *core.Relayer
 }
 
 // NewWSConnector creates a new WSConnector with optimized buffer size.
 func NewWSConnector(conn *websocket.Conn, pubKey [32]byte, rel *core.Relayer, outBufSize int) *WSConnector {
-	if outBufSize <= 0 {
-		outBufSize = 64 // Buffer sized for high-throughput bursts
-	}
+	// if outBufSize <= 0 {
+	// 	outBufSize = 64 // Buffer sized for high-throughput bursts
+	// }
 	return &WSConnector{
 		conn:    conn,
 		pubKey:  pubKey,
-		outChan: make(chan core.Message, outBufSize),
+		outChan: make(chan core.OutMessage, 256),
 		relayer: rel,
 	}
 }
@@ -35,9 +35,9 @@ func NewWSConnector(conn *websocket.Conn, pubKey [32]byte, rel *core.Relayer, ou
 func (c *WSConnector) ID() [32]byte { return c.pubKey }
 
 // SafePush handles asynchronous delivery for non-critical or external paths.
-func (c *WSConnector) SafePush(msg core.Message) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *WSConnector) SafePush(msg core.OutMessage) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.isClosed {
 		return false
 	}
@@ -63,23 +63,31 @@ func (c *WSConnector) Close() {
 }
 
 // ReadLoop is the primary pump. It handles binary protocol parsing and relaying.
-func (c *WSConnector) ReadLoop(ctx context.Context) error {
+func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 	defer func() {
 		c.relayer.Unregister(c.pubKey)
 		c.Close()
 	}()
 
 	// Start Write Pump for SafePush fallback
-	go func() {
+	go func(relayer *core.Relayer) {
 		for msg := range c.outChan {
-			wctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			_ = c.conn.Write(wctx, websocket.MessageBinary, msg)
+			wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := c.conn.Write(wctx, websocket.MessageBinary, msg.Msg)
+			if err == nil {
+				relayer.IncrementDelivered()
+				relayer.RecordLatency(time.Since(msg.RecvTime))
+			} else {
+				c.relayer.IncrementNoRecipient()
+			}
 			cancel()
 		}
-	}()
+	}(c.relayer)
 
 	for {
 		mt, data, err := c.conn.Read(ctx)
+		// capture receive timestamp to measure receive->deliver latency
+		recvTime := time.Now()
 		if err != nil {
 			return err
 		}
@@ -95,9 +103,6 @@ func (c *WSConnector) ReadLoop(ctx context.Context) error {
 
 		// CASE: No recipients => broadcast to all (except sender)
 		if nTo == 0 {
-			c.relayer.IncrementProcessed()
-			// Use relayer Multicast to push to all connectors (excluding sender handled in Multicast)
-			c.relayer.Multicast(msg)
 			continue
 		}
 
@@ -108,20 +113,17 @@ func (c *WSConnector) ReadLoop(ctx context.Context) error {
 			targets[i] = msg.ToIDAt(i)
 		}
 
-		// 2. In-place Zeroing and Stats
-		msg.ZeroToIDs()
+		// 2. In-place Stats
 		c.relayer.IncrementProcessed()
 
 		// 3. Clone once for the entire relay group
 		// TODO: We can make a pool of pre-allocated buffers to reduce GC pressure for large messages
 		msgClone := make(core.Message, len(msg))
 		copy(msgClone, msg)
-
-		// capture receive timestamp to measure receive->deliver latency
-		recvTime := time.Now()
+		msgClone.ZeroToIDs()
 
 		// 4. Fire the relay task to a separate goroutine
-		go c.Relay(ctx, msgClone, targets, recvTime) // Pass the original ToIDs for routing, but the payload is zeroed
+		c.Relay(ctx, msgClone, targets, recvTime) // Pass the original ToIDs for routing, but the payload is zeroed
 	}
 }
 
@@ -134,10 +136,14 @@ func (c *WSConnector) Relay(ctx context.Context, msg core.Message, targets [][32
 	}
 
 	matched := 0
+	outMsg := core.OutMessage{
+		Msg:      msg,
+		RecvTime: recvTime,
+	}
 	for _, target := range targets {
 		if dest, ok := c.relayer.Get(target); ok {
 			matched++
-			c.deliver(ctx, dest, msg, recvTime)
+			c.deliver(ctx, dest, outMsg, recvTime)
 		} else {
 		}
 	}
@@ -147,14 +153,9 @@ func (c *WSConnector) Relay(ctx context.Context, msg core.Message, targets [][32
 	}
 }
 
-func (c *WSConnector) deliver(ctx context.Context, dest core.Connector, msg core.Message, recvTime time.Time) {
+func (c *WSConnector) deliver(ctx context.Context, dest core.Connector, msg core.OutMessage, recvTime time.Time) {
 
-	if dest.SafePush(msg) {
-		// record delivered counter and latency from receive -> deliver
-		c.relayer.IncrementDelivered()
-		c.relayer.RecordLatency(time.Since(recvTime))
-	} else {
-		// push failed (backpressure/drop)
+	if !dest.SafePush(msg) {
 		c.relayer.IncrementNoRecipient()
 	}
 }

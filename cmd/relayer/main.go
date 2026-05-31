@@ -15,9 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/nguyenzung/relayer-server/internal/core"
 	"github.com/nguyenzung/relayer-server/internal/network"
-	"github.com/coder/websocket"
 )
 
 // Server wraps HTTP server and relayer and exposes monitoring endpoints.
@@ -108,7 +108,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	c := network.NewWSConnector(conn, pubKey, s.rel, s.outBuf)
 	s.rel.Register(pubKey, c)
 
-	if err := c.ReadLoop(r.Context()); err != nil {
+	if err := c.ReadWriteLoop(r.Context()); err != nil {
 		// log.Printf("ReadLoop exited for pub=%s err=%v", pub, err)
 	} else {
 		// log.Printf("ReadLoop exited normally for pub=%s", pub)
@@ -192,7 +192,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
-	outBuf := flag.Int("outbuf", 64, "per-connection outbound buffer size")
+	outBuf := flag.Int("outbuf", 8192, "per-connection outbound buffer size")
 	flag.Parse()
 
 	srv := NewServer(*addr, *outBuf)

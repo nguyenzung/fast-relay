@@ -27,8 +27,8 @@ import (
 
 func main() {
 	addr := flag.String("addr", "localhost:8080", "server address host:port")
-	n := flag.Int("n", 15000, "number of concurrent connectors")
-	m := flag.Int("m", 6, "messages per second per connector when online")
+	n := flag.Int("n", 25000, "number of concurrent connectors")
+	m := flag.Int("m", 5, "messages per second per connector when online")
 	dur := flag.Duration("duration", 0, "test duration (0 = until SIGINT)")
 	outBuf := flag.Int("outbuf", 64, "per-connection outbound buffer size")
 	seed := flag.Int64("seed", time.Now().UnixNano(), "random seed")
@@ -239,12 +239,9 @@ func runChurnClient(ctx context.Context, addr string, pubs [][32]byte, pubsStr [
 			case <-onTimer.C:
 				loopDone = true
 			case <-ticker.C:
-				// random payload size 512..4096
-				sz := 512 + int(r.Int63n(4096-512+1))
+				// random payload size 512..2048
+				sz := 512 + int(r.Int63n(2048-512+1))
 				payload := make([]byte, sz)
-				for i := 0; i < sz; i++ {
-					payload[i] = byte('a' + r.Intn(26))
-				}
 				// pick a random existing target excluding self
 				if n <= 1 {
 					// no target available
