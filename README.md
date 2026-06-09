@@ -2,7 +2,7 @@
 
 Fast Relay is a high-performance WebSocket Relay Server written in Go, optimized for message routing between clients based on Public Keys (Ed25519 or equivalent).
 
-The project focuses on handling tens of thousands of concurrent connections with extremely low latency and minimal resource consumption through a Zero-copy architecture and asynchronous processing.
+The project focuses on handling tens of thousands of concurrent connections with extremely low latency and minimal resource consumption through an asynchronous processing.
 
 ## 🚀 Key Features
 
