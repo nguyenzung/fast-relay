@@ -1,7 +1,7 @@
 package mem
 
 // Buffer holds an uninitialized byte region.
-// On Linux the backing store is C malloc (no zero-fill).
+// On Linux the backing store is jemalloc (no zero-fill).
 // On other platforms it falls back to make (zero-filled).
 //
 // Always keep the *Buffer alive at least as long as Bytes() is in use —
