@@ -1,6 +1,7 @@
 # Makefile for relayer-server
 # Usage:
 #   make build          - build the relayer binary into ./bin/relayer
+#   make build-aarch64  - build the relayer binary for linux/arm64 into ./bin/relayer-aarch64
 #   make client         - build the client binary into ./bin/client
 #   make loadtest       - build the loadtest binary into ./bin/loadtest
 #   make stress         - build then run the loadtest binary (use ARGS to pass args)
@@ -18,7 +19,7 @@ CLIENT_BIN=bin/client
 LOADTEST_BIN=bin/loadtest
 PKG=./...
 
-.PHONY: all build client loadtest stress run start test fmt vet lint deps clean churntest churn metrics
+.PHONY: all build build-aarch64 client loadtest stress run start test fmt vet lint deps clean churntest churn metrics
 all: build
 
 metrics:
@@ -29,6 +30,11 @@ build: deps | bin
 	@echo "Building $(BINARY)..."
 	go build -o $(BINARY) ./cmd/relayer
 	@echo "Built $(BINARY)"
+
+build-aarch64: deps | bin
+	@echo "Building $(BINARY) for aarch64 (linux/arm64)..."
+	GOOS=linux GOARCH=arm64 go build -o bin/relayer-aarch64 ./cmd/relayer
+	@echo "Built bin/relayer-aarch64"
 
 client: deps | bin
 	@echo "Building client $(CLIENT_BIN)..."
