@@ -3,6 +3,8 @@ package core
 import (
 	"encoding/binary"
 	"time"
+
+	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
 // Message is a zero-copy byte slice view of the raw network buffer.
@@ -78,4 +80,7 @@ func (m Message) ZeroToIDs() {
 type OutMessage struct {
 	Msg      Message
 	RecvTime time.Time
+	// Buf keeps the backing allocator alive until this message is consumed.
+	// On Linux, Buf holds a CGO malloc'd region; on other platforms it is nil.
+	Buf *mem.Buffer
 }

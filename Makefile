@@ -1,5 +1,7 @@
 # Makefile for relayer-server
 # Usage:
+#   make setup-jemalloc - install libjemalloc-dev (required for Linux builds)
+#   make check-jemalloc - verify jemalloc is available
 #   make build          - build the relayer binary into ./bin/relayer
 #   make build-aarch64  - build the relayer binary for linux/arm64 into ./bin/relayer-aarch64
 #   make client         - build the client binary into ./bin/client
@@ -19,14 +21,23 @@ CLIENT_BIN=bin/client
 LOADTEST_BIN=bin/loadtest
 PKG=./...
 
-.PHONY: all build build-aarch64 client loadtest stress run start test fmt vet lint deps clean churntest churn metrics
+.PHONY: all build build-aarch64 client loadtest stress run start test fmt vet lint deps clean churntest churn metrics setup-jemalloc check-jemalloc
 all: build
+
+setup-jemalloc:
+	@echo "Setting up jemalloc..."
+	./scripts/setup_jemalloc.sh
+
+check-jemalloc:
+	@pkg-config --libs jemalloc >/dev/null 2>&1 \
+		&& echo "jemalloc $(shell pkg-config --modversion jemalloc 2>/dev/null) found." \
+		|| (echo "ERROR: libjemalloc-dev not found. Run 'make setup-jemalloc' first." >&2 && exit 1)
 
 metrics:
 	@echo "Starting metrics collection..."
 	./scripts/collect_metrics.sh
 
-build: deps | bin
+build: check-jemalloc deps | bin
 	@echo "Building $(BINARY)..."
 	go build -o $(BINARY) ./cmd/relayer
 	@echo "Built $(BINARY)"

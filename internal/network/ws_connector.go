@@ -7,6 +7,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/nguyenzung/relayer-server/internal/core"
+	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
 // WSConnector implements core.Connector using coder/websocket.
@@ -80,6 +81,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 			} else {
 				c.relayer.IncrementNoRecipient()
 			}
+			msg.Buf.Release() // drop reference acquired in Relay
 			cancel()
 		}
 	}(c.relayer)
@@ -116,46 +118,45 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 		// 2. In-place Stats
 		c.relayer.IncrementProcessed()
 
-		// 3. Clone once for the entire relay group
-		// TODO: We can make a pool of pre-allocated buffers to reduce GC pressure for large messages
-		msgClone := make(core.Message, len(msg))
+		// 3. Clone once for the entire relay group — malloc on Linux (no zero-fill).
+		buf := mem.NewBuffer(len(msg))
+		msgClone := core.Message(buf.Bytes())
 		copy(msgClone, msg)
 		msgClone.ZeroToIDs()
 
-		// 4. Fire the relay task to a separate goroutine
-		c.Relay(ctx, msgClone, targets, recvTime) // Pass the original ToIDs for routing, but the payload is zeroed
+		// 4. Fire the relay task to a separate goroutine.
+		c.Relay(ctx, msgClone, buf, targets, recvTime)
 	}
 }
 
 // Relay handles only targeted multicast.
 // If targets is empty, it simply returns after incrementing the no-recipient counter.
-func (c *WSConnector) Relay(ctx context.Context, msg core.Message, targets [][32]byte, recvTime time.Time) {
+func (c *WSConnector) Relay(ctx context.Context, msg core.Message, buf *mem.Buffer, targets [][32]byte, recvTime time.Time) {
 	if len(targets) == 0 {
 		c.relayer.IncrementNoRecipient()
+		buf.Release() // drop the initial ref; nobody else will
 		return
 	}
 
 	matched := 0
-	outMsg := core.OutMessage{
-		Msg:      msg,
-		RecvTime: recvTime,
-	}
 	for _, target := range targets {
 		if dest, ok := c.relayer.Get(target); ok {
-			matched++
-			c.deliver(ctx, dest, outMsg, recvTime)
-		} else {
+			// Retain before each push so the write pump can Release independently.
+			buf.Retain()
+			outMsg := core.OutMessage{Msg: msg, RecvTime: recvTime, Buf: buf}
+			if dest.SafePush(outMsg) {
+				matched++
+			} else {
+				c.relayer.IncrementNoRecipient()
+				buf.Release() // push dropped, undo retain
+			}
 		}
 	}
 
+	// Release the initial ref from NewBuffer
+	buf.Release()
+
 	if matched == 0 {
-		c.relayer.IncrementNoRecipient()
-	}
-}
-
-func (c *WSConnector) deliver(ctx context.Context, dest core.Connector, msg core.OutMessage, recvTime time.Time) {
-
-	if !dest.SafePush(msg) {
 		c.relayer.IncrementNoRecipient()
 	}
 }
