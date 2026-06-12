@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/nguyenzung/relayer-server/internal/core"
 )
 
 // Interactive CLI client to connect to the relayer and send messages.
@@ -153,8 +154,9 @@ loop:
 			buf = append(buf, pubKey[:]...)
 			// ToIDsLen
 			n := len(currentRecipients)
-			if n > 255 {
-				n = 255
+			if n > core.MaxTargetsPerMessage {
+				fmt.Printf("warning: truncating recipients to server max (%d)\n", core.MaxTargetsPerMessage)
+				n = core.MaxTargetsPerMessage
 			}
 			buf = append(buf, byte(n))
 			// ToIDs
@@ -181,8 +183,8 @@ loop:
 				frame := make([]byte, 0, 32+1+len(currentRecipients)*32+4+len(chunk))
 				frame = append(frame, pubKey[:]...)
 				n := len(currentRecipients)
-				if n > 255 {
-					n = 255
+				if n > core.MaxTargetsPerMessage {
+					n = core.MaxTargetsPerMessage
 				}
 				frame = append(frame, byte(n))
 				for i := 0; i < n; i++ {
