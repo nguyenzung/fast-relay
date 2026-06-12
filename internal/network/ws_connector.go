@@ -2,12 +2,21 @@ package network
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
+	"io"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/nguyenzung/relayer-server/internal/core"
 	"github.com/nguyenzung/relayer-server/internal/mem"
+)
+
+var (
+	ErrMessageTooLarge = errors.New("message too large")
+	ErrInvalidMessage  = errors.New("invalid message")
+	errSkipMessage     = errors.New("skip") // internal sentinel — not a connection error
 )
 
 // WSConnector implements core.Connector using coder/websocket.
@@ -20,22 +29,20 @@ type WSConnector struct {
 	relayer  *core.Relayer
 }
 
-// NewWSConnector creates a new WSConnector with optimized buffer size.
 func NewWSConnector(conn *websocket.Conn, pubKey [32]byte, rel *core.Relayer, outBufSize int) *WSConnector {
-	// if outBufSize <= 0 {
-	// 	outBufSize = 64 // Buffer sized for high-throughput bursts
-	// }
+	if outBufSize <= 0 {
+		outBufSize = 256
+	}
 	return &WSConnector{
 		conn:    conn,
 		pubKey:  pubKey,
-		outChan: make(chan core.OutMessage, 256),
+		outChan: make(chan core.OutMessage, outBufSize),
 		relayer: rel,
 	}
 }
 
 func (c *WSConnector) ID() [32]byte { return c.pubKey }
 
-// SafePush handles asynchronous delivery for non-critical or external paths.
 func (c *WSConnector) SafePush(msg core.OutMessage) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -60,81 +67,181 @@ func (c *WSConnector) Close() {
 	close(c.outChan)
 	c.mu.Unlock()
 	_ = c.conn.Close(websocket.StatusNormalClosure, "closing")
-	// log close
 }
 
-// ReadLoop is the primary pump. It handles binary protocol parsing and relaying.
-func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
-	defer func() {
-		c.relayer.Unregister(c.pubKey)
-		c.Close()
-	}()
+// readMessage reads exactly one relay protocol message from r into a
+// precisely-sized mem.Buffer, parsing the fixed header first to compute the
+// exact allocation size.
+//
+// Layout: FromID(32) | ToIDsLen(1) | ToIDs(N*32) | DataLen(4) | Data(DataLen)
+//
+// Returns:
+//   - (buf, nil)           — valid message, caller owns buf
+//   - (nil, errSkipMessage) — nTo==0, reader drained, connection continues
+//   - (nil, ErrInvalidMessage) — protocol violation (nTo>max, trailing bytes); caller closes connection
+//   - (nil, ErrMessageTooLarge) — DataLen exceeds limit; caller closes connection
+//   - (nil, other error)   — I/O error; caller closes connection
+//
+// errSkipMessage paths drain r to EOF so the connection can continue.
+// All other error paths do not drain (caller will close the connection).
+func readMessage(r io.Reader, maxDataLen int) (*mem.Buffer, error) {
+	// Step 1: fixed prefix — FromID(32) + ToIDsLen(1)
+	var hdr [33]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
 
-	// Start Write Pump for SafePush fallback
+	nTo := int(hdr[32])
+	if nTo == 0 {
+		// No recipients — valid frame but nothing to relay. Drain to keep connection alive.
+		_, _ = io.Copy(io.Discard, r)
+		return nil, errSkipMessage
+	}
+	if nTo > core.MaxTargetsPerMessage {
+		// Exceeding the per-message target cap is a protocol violation; close the connection.
+		// No drain — caller will close.
+		return nil, ErrInvalidMessage
+	}
+
+	// Step 2: ToIDs(N*32) + DataLen(4) — fits in a fixed stack buffer.
+	toIDsLen := nTo * 32
+	var tail [core.MaxTargetsPerMessage*32 + 4]byte
+	tailN := toIDsLen + 4
+	if _, err := io.ReadFull(r, tail[:tailN]); err != nil {
+		return nil, err
+	}
+
+	dataLen := int(binary.BigEndian.Uint32(tail[toIDsLen : toIDsLen+4]))
+	if dataLen > maxDataLen {
+		// No drain — caller will close.
+		return nil, ErrMessageTooLarge
+	}
+
+	// Step 3: allocate exactly the bytes the message requires.
+	prefixLen := 33 + tailN
+	totalLen := prefixLen + dataLen
+	buf := mem.NewBuffer(totalLen)
+	data := buf.Bytes()
+	copy(data[:33], hdr[:])
+	copy(data[33:prefixLen], tail[:tailN])
+
+	if dataLen > 0 {
+		if _, err := io.ReadFull(r, data[prefixLen:]); err != nil {
+			buf.Release()
+			return nil, err
+		}
+	}
+
+	// EOF probe: if DataLen was understated the client sent extra bytes inside this
+	// WebSocket frame. coder/websocket silently discards them on the next Reader()
+	// call, so without this check the message would be accepted as valid.
+	var probe [1]byte
+	n, err := r.Read(probe[:])
+	if n > 0 {
+		buf.Release()
+		return nil, ErrInvalidMessage
+	}
+	if err != io.EOF {
+		buf.Release()
+		if err == nil {
+			return nil, ErrInvalidMessage
+		}
+		return nil, err
+	}
+
+	return buf, nil
+}
+
+// ReadWriteLoop is the primary pump. It handles binary protocol parsing and relaying.
+func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
+	defer c.Close()
+	defer c.relayer.Unregister(c.pubKey)
+
 	go func(relayer *core.Relayer) {
 		for msg := range c.outChan {
-			wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
 			err := c.conn.Write(wctx, websocket.MessageBinary, msg.Msg)
-			if err == nil {
-				relayer.IncrementDelivered()
-				relayer.RecordLatency(time.Since(msg.RecvTime))
-			} else {
-				c.relayer.IncrementNoRecipient()
+			wcancel()
+			if msg.Buf != nil {
+				msg.Buf.Release()
 			}
-			msg.Buf.Release() // drop reference acquired in Relay
-			cancel()
+			if err != nil {
+				relayer.IncrementNoRecipient()
+				// Close unblocks conn.Reader() in the main loop and closes outChan.
+				c.Close()
+				for msg := range c.outChan {
+					if msg.Buf != nil {
+						msg.Buf.Release()
+					}
+				}
+				return
+			}
+			relayer.IncrementDelivered()
+			relayer.RecordLatency(time.Since(msg.RecvTime))
 		}
 	}(c.relayer)
 
 	for {
-		mt, data, err := c.conn.Read(ctx)
-		// capture receive timestamp to measure receive->deliver latency
-		recvTime := time.Now()
+		mt, r, err := c.conn.Reader(ctx)
 		if err != nil {
 			return err
 		}
 		if mt != websocket.MessageBinary {
-			continue
-		}
-		if len(data) < 35 {
+			_, _ = io.Copy(io.Discard, r)
 			continue
 		}
 
-		msg := core.Message(data)
+		buf, err := readMessage(r, core.MaxMessageSize)
+		// recvTime captured after full message is in memory — equivalent to conn.Read() semantics.
+		recvTime := time.Now()
+		if errors.Is(err, errSkipMessage) {
+			continue
+		}
+		if errors.Is(err, ErrMessageTooLarge) {
+			_ = c.conn.Close(websocket.StatusMessageTooBig, "message too large")
+			return err
+		}
+		if errors.Is(err, ErrInvalidMessage) {
+			_ = c.conn.Close(websocket.StatusUnsupportedData, "invalid message")
+			return err
+		}
+		if err != nil {
+			return err
+		}
+
+		// nTo already validated (1..core.MaxTargetsPerMessage) inside readMessage.
+		msg := core.Message(buf.Bytes())
 		nTo := int(msg.ToIDsLen())
 
-		// CASE: No recipients => broadcast to all (except sender)
-		if nTo == 0 {
+		var targets [core.MaxTargetsPerMessage][32]byte
+		targetN := 0
+		for i := 0; i < nTo; i++ {
+			id := msg.ToIDAt(i)
+			if id == c.pubKey {
+				continue
+			}
+			targets[targetN] = id
+			targetN++
+		}
+
+		if targetN == 0 {
+			buf.Release()
 			continue
 		}
 
-		// 1. Prepare targets slice (Dynamic handling)
-		// Since we're going async, we allocate this on the heap to be safe
-		targets := make([][32]byte, nTo)
-		for i := 0; i < nTo; i++ {
-			targets[i] = msg.ToIDAt(i)
-		}
-
-		// 2. In-place Stats
 		c.relayer.IncrementProcessed()
-
-		// 3. Clone once for the entire relay group — malloc on Linux (no zero-fill).
-		buf := mem.NewBuffer(len(msg))
-		msgClone := core.Message(buf.Bytes())
-		copy(msgClone, msg)
-		msgClone.ZeroToIDs()
-
-		// 4. Fire the relay task to a separate goroutine.
-		c.Relay(ctx, msgClone, buf, targets, recvTime)
+		// ZeroToIDs zeros m[33:33+N*32] in-place. ToIDsLen (m[32]) and
+		// DataLen/Data offsets are untouched, so the protocol layout stays valid.
+		msg.ZeroToIDs()
+		c.Relay(ctx, msg, buf, targets[:targetN], recvTime)
 	}
 }
 
 // Relay handles only targeted multicast.
-// If targets is empty, it simply returns after incrementing the no-recipient counter.
 func (c *WSConnector) Relay(ctx context.Context, msg core.Message, buf *mem.Buffer, targets [][32]byte, recvTime time.Time) {
 	if len(targets) == 0 {
 		c.relayer.IncrementNoRecipient()
-		buf.Release() // drop the initial ref; nobody else will
+		buf.Release()
 		return
 	}
 
@@ -153,7 +260,7 @@ func (c *WSConnector) Relay(ctx context.Context, msg core.Message, buf *mem.Buff
 		}
 	}
 
-	// Release the initial ref from NewBuffer
+	// Release the initial ref from NewBuffer.
 	buf.Release()
 
 	if matched == 0 {

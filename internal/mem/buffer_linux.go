@@ -37,9 +37,11 @@ func (b *Buffer) Release() {
 	if n < 0 {
 		panic("mem.Buffer.Release: double free")
 	}
-	if n == 0 && b.ptr != nil {
-		C.free(b.ptr)
-		b.ptr = nil
-		b.data = nil
+	if n == 0 {
+		if b.ptr != nil {
+			C.free(b.ptr)
+			b.ptr = nil
+			b.data = nil
+		}
 	}
 }

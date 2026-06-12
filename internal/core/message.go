@@ -7,6 +7,15 @@ import (
 	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
+// Protocol-level limits shared by server and clients.
+const (
+	// MaxTargetsPerMessage is the maximum number of recipients in a single message.
+	// Messages exceeding this are treated as protocol violations and close the connection.
+	MaxTargetsPerMessage = 10
+	// MaxMessageSize is the maximum allowed size of the Data field in bytes.
+	MaxMessageSize = 512 * 1024
+)
+
 // Message is a zero-copy byte slice view of the raw network buffer.
 // Layout: [FromID:32][ToIDsLen:1][ToIDs:N*32][DataLen:4][Payload:M]
 type Message []byte

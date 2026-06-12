@@ -15,7 +15,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
-	outBuf := flag.Int("outbuf", 8192, "per-connection outbound buffer size")
+	outBuf := flag.Int("outbuf", 256, "per-connection outbound buffer size")
 	flag.Parse()
 
 	srv := server.NewServer(*addr, *outBuf, nil, nil)
