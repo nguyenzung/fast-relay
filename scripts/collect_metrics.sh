@@ -3,7 +3,7 @@
 # Configuration
 URL="http://localhost:8080/metrics"
 OUTPUT_FILE="churn_test_benchmark.md"
-INTERVAL=180 # 3 minutes (180 seconds)
+INTERVAL=5 # 3 minutes (180 seconds)
 
 echo "Collecting metrics from $URL every $INTERVAL seconds..."
 echo "Output file: $OUTPUT_FILE"
