@@ -298,26 +298,7 @@ func runConnector(ctx context.Context, addr string, pubs [][32]byte, pubsStr []s
 				targetIdx = i
 			}
 
-			// occasional broadcast (1% chance)
-			if r.Intn(100) == 0 {
-				// build frame: FromID, ToIDsLen=0, DataLen, Data
-				var buf []byte
-				fromKey := pubs[idx]
-				buf = append(buf, fromKey[:]...)
-				buf = append(buf, 0)
-				var lenb [4]byte
-				binary.BigEndian.PutUint32(lenb[:], uint32(payloadLen))
-				buf = append(buf, lenb[:]...)
-				buf = append(buf, payload...)
-				if err := conn.Write(ctx, websocket.MessageBinary, buf); err != nil {
-					totalErr.Add(1)
-					return
-				}
-				totalSent.Add(1)
-				continue
-			}
-
-			// targeted message
+			// targeted message (nTo=0 broadcast is not supported by the server)
 			var buf []byte
 			fromKey := pubs[idx]
 			buf = append(buf, fromKey[:]...)
