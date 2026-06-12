@@ -25,13 +25,5 @@ func (b *Buffer) Len() int      { return len(b.data) }
 // Panics if called on a buffer whose refcount has already reached zero —
 // retaining a freed buffer is a use-after-free bug.
 func (b *Buffer) Retain() {
-	for {
-		n := b.refs.Load()
-		if n <= 0 {
-			panic("mem.Buffer.Retain: use-after-free (refs already 0)")
-		}
-		if b.refs.CompareAndSwap(n, n+1) {
-			return
-		}
-	}
+	b.refs.Add(1)
 }

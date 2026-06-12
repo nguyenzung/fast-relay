@@ -81,8 +81,8 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 			} else {
 				c.relayer.IncrementNoRecipient()
 			}
-			cancel()
 			msg.Buf.Release() // drop reference acquired in Relay
+			cancel()
 		}
 	}(c.relayer)
 
@@ -133,8 +133,8 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 // If targets is empty, it simply returns after incrementing the no-recipient counter.
 func (c *WSConnector) Relay(ctx context.Context, msg core.Message, buf *mem.Buffer, targets [][32]byte, recvTime time.Time) {
 	if len(targets) == 0 {
-		buf.Release() // drop the initial ref; nobody else will
 		c.relayer.IncrementNoRecipient()
+		buf.Release() // drop the initial ref; nobody else will
 		return
 	}
 
@@ -147,13 +147,13 @@ func (c *WSConnector) Relay(ctx context.Context, msg core.Message, buf *mem.Buff
 			if dest.SafePush(outMsg) {
 				matched++
 			} else {
-				buf.Release() // push dropped, undo retain
 				c.relayer.IncrementNoRecipient()
+				buf.Release() // push dropped, undo retain
 			}
 		}
 	}
 
-	// Release the initial ref from NewBuffer — all live refs are now owned by write pumps.
+	// Release the initial ref from NewBuffer
 	buf.Release()
 
 	if matched == 0 {
