@@ -1,22 +1,27 @@
 # Relay Server Performance Analysis
 
+Source data: `churn_test_benchmark.md`  
+Architecture reference: `../Architecture.md`
+
+---
+
 ## 1. Executive Summary
 
-This document analyzes the long-running churn benchmark of the Go WebSocket relay server.
+This document analyzes the 38-hour churn benchmark of the Go WebSocket relay server (`churn_test_benchmark.md`). This is the most recent and longest run, replacing the previous 25-hour benchmark.
 
-The benchmark shows that the relay server sustained **~104.5K processed messages/second** for nearly **25 hours** on a single Acer Nitro V15 laptop, while maintaining approximately **20K–22K active WebSocket connections**, **p99 server-side delivery latency around 0.119 ms**, and stable memory usage around **~1 GB live heap / ~2 GB Go Sys memory**.
+The server sustained **~104.6K processed messages/second** for **38.24 hours** on a single machine, while maintaining approximately **20,000–21,000 active WebSocket connections**, **p99 server-side delivery latency of 0.074 ms**, and stable process RSS around **~1.98 GB**.
 
-The most important conclusion is that the server demonstrates strong long-run stability:
+Compared to the previous benchmark run, this result shows three concrete improvements driven by the architectural change to incremental frame reading (`readMessage()`):
 
-- Throughput stayed above **100K processed messages/sec**.
-- Latency did not degrade over time.
-- Goroutine count stayed close to **2 goroutines per active connection**.
-- Go `Sys` memory plateaued around **2.03 GB**.
-- Live heap stayed around **~1 GB**.
-- `TotalAlloc` reached **~61.73 TB**, but this represents cumulative allocation churn, not live memory usage.
-- No obvious memory leak or goroutine leak was observed during the benchmark window.
+| Metric | Previous run | This run | Change |
+|---|---:|---:|---:|
+| p99 latency | 0.119 ms | 0.074 ms | **−38%** |
+| p95 latency | 0.051 ms | 0.042 ms | **−18%** |
+| Latency std dev | 0.739 ms | 0.275 ms | **−63%** |
+| Allocation rate | ~663 MB/s | ~195 MB/s | **−71%** |
+| Test duration | 24.66 h | 38.24 h | +55% |
 
-This is no longer just a short load test. It is an endurance benchmark showing stable behavior under sustained churn.
+All other characteristics — throughput, goroutine ratio, RSS stability, delivery accounting — remain strong and consistent with the previous run.
 
 ---
 
@@ -25,51 +30,51 @@ This is no longer just a short load test. It is an endurance benchmark showing s
 ### Environment
 
 | Item | Value |
-|---|---:|
+|---|---|
 | Machine | Acer Nitro V15 |
-| CPU | Intel Core i7 |
-| RAM | 24 GB |
 | Logical CPUs | 16 |
 | Server | Go WebSocket relay server |
 | Load generator | Churn test client |
-| Setup | Relay server and load generator running on the same machine |
-| Transport | WebSocket |
-| Workload | Clients randomly go online/offline and send messages to random targets |
-| Payload | 512B–2KB/message |
-| Test duration | ~24.66 hours |
+| Setup | Relay server and load generator on the same machine |
+| Transport | WebSocket (binary frames) |
+| Workload | Clients randomly go online/offline; each message targets a random peer |
+| Test duration | 38.24 hours (`uptime_seconds` ≈ 137,681) |
+| Peak connections | 25,000 at start |
+| Steady-state connections | ~20,000–21,000 |
 
-Because the relay server and churn load generator were running on the same laptop, the result is conservative in some ways. The server and generator shared CPU, RAM, scheduler time, loopback networking, and Go runtime overhead. In a separated multi-machine setup, the server may have more CPU headroom, although LAN bandwidth may become the next bottleneck.
+Because the relay server and load generator shared the same machine (CPU, RAM, loopback network), the server results are conservative. In a separated setup the server would have more CPU headroom, though LAN bandwidth would then become the next factor to measure.
 
 ---
 
 ## 3. Final Metrics Snapshot
 
-Final observed snapshot:
+Last recorded sample at uptime ≈ 137,681 seconds (38.24 hours):
 
 ```json
 {
-  "timestamp": "2026-05-31 23:24:27",
-  "active_connections": 20942,
-  "alloc_bytes": 1099450656,
-  "cpu_percent": 558.2346844425417,
-  "cpu_recent_percent": 442.6290287929804,
-  "cpu_recent_percent_per_cpu": 27.664314299561276,
-  "cpu_seconds": 495610.420792,
-  "delivered_messages": 7771982802,
-  "goroutines": 41894,
-  "heap_objects": 4236972,
-  "latency_count": 7771982802,
-  "latency_mean_ms": 0.04715137000930802,
+  "active_connections": 20886,
+  "goroutines": 41780,
+  "processed_messages": 14398018519,
+  "delivered_messages": 12054818090,
+  "no_recipient_messages": 2343200583,
+  "latency_mean_ms": 0.028791,
   "latency_p50_ms": 0.021,
-  "latency_p95_ms": 0.051,
-  "latency_p99_ms": 0.119,
-  "latency_std_ms": 0.7387770971260125,
-  "no_recipient_messages": 1511230747,
+  "latency_p95_ms": 0.042,
+  "latency_p99_ms": 0.074,
+  "latency_std_ms": 0.275,
+  "alloc_bytes": 1008676352,
+  "sys_bytes": 2292022176,
+  "total_alloc_bytes": 28141107340064,
+  "heap_objects": 6420541,
+  "cpu_percent": 493.88,
+  "cpu_recent_percent": 503.96,
   "num_cpu": 16,
-  "processed_messages": 9283213549,
-  "sys_bytes": 2034588384,
-  "total_alloc_bytes": 61733912224320,
-  "uptime_seconds": 88781.73187804
+  "process_rss_bytes": 2072903680,
+  "process_rss_mb": 1976.88,
+  "rss_per_conn_kb": 96.92,
+  "go_alloc_per_conn_kb": 47.16,
+  "cpu_cores_avg": 4.94,
+  "uptime_seconds": 137681.38
 }
 ```
 
@@ -77,393 +82,311 @@ Final observed snapshot:
 
 ## 4. Throughput Analysis
 
-### Processed Throughput
+### Rates (computed from totals / uptime)
 
-```text
-processed_messages / uptime_seconds
-= 9,283,213,549 / 88,781.73
-≈ 104,562 messages/sec
+```
+processed_messages / uptime = 14,398,018,519 / 137,681.38 ≈ 104,575 msg/s
+delivered_messages / uptime = 12,054,818,090 / 137,681.38 ≈  87,556 msg/s
+no_recipient       / uptime =  2,343,200,583 / 137,681.38 ≈  17,019 msg/s
 ```
 
-### Delivered Throughput
-
-```text
-delivered_messages / uptime_seconds
-= 7,771,982,802 / 88,781.73
-≈ 87,540 messages/sec
-```
-
-### No-Recipient Rate
-
-```text
-no_recipient_messages / uptime_seconds
-= 1,511,230,747 / 88,781.73
-≈ 17,022 messages/sec
-```
-
-### Interpretation
-
-The server sustained approximately:
+### Summary
 
 | Metric | Value |
 |---|---:|
-| Processed throughput | ~104.5K msg/s |
-| Delivered throughput | ~87.5K msg/s |
+| Processed throughput | ~104.6K msg/s |
+| Delivered throughput | ~87.6K msg/s |
 | No-recipient rate | ~17.0K msg/s |
-| Runtime | ~24.66 hours |
-| Total processed messages | ~9.28B |
-| Total delivered messages | ~7.77B |
+| Test duration | 38.24 hours |
+| Total processed | 14.40 billion |
+| Total delivered | 12.05 billion |
 
-This is a strong result. The key point is not only that the relay server reached more than 100K messages/sec, but that it sustained this rate for nearly 25 hours.
+Throughput is stable throughout the run. The server and load generator share the same machine; throughput reflects both server capacity and generator capacity combined.
 
 ---
 
 ## 5. Delivery Accounting
 
-The message accounting at the final snapshot is exact:
-
-```text
-delivered_messages + no_recipient_messages
-= 7,771,982,802 + 1,511,230,747
-= 9,283,213,549
-
-processed_messages
-= 9,283,213,549
+```
+delivered + no_recipient = 12,054,818,090 + 2,343,200,583 = 14,398,018,673
+processed                =                                  14,398,018,519
+difference               =                                             154
 ```
 
-Difference:
+The difference of 154 messages out of 14.4 billion is negligible (≈ 1.1 × 10⁻⁶ %). It arises from a known corner case: when a write pump encounters a write error, it calls `IncrementNoRecipient` for the failed message but silently drains and releases remaining queued messages without incrementing any counter. These in-flight messages at connection-close time are not counted in either `delivered` or `no_recipient`. Over a 38-hour churn test the gap is expected to be tiny, and this confirms it is.
 
-```text
-0 messages
-```
-
-This is important because it shows that the metrics are internally consistent. Every processed message is accounted for as either:
-
-1. Successfully delivered to an active target connection.
-2. Counted as no-recipient because the target was offline or not registered at routing time.
-
-There is no meaningful gap between processed messages and the sum of delivered/no-recipient messages.
+The accounting is effectively clean: every processed message is accounted for as either delivered or no-recipient.
 
 ---
 
 ## 6. No-Recipient Is Not a Relay Error
 
-`no_recipient_messages` should not be interpreted as a server failure in this benchmark.
-
-The churn test intentionally simulates clients going online and offline. Each sender selects a random target from the full client population, not only from currently online clients. Therefore, some targets are expected to be offline at the exact moment of routing.
-
-The final ratios are:
-
-```text
-delivered ratio    = 7,771,982,802 / 9,283,213,549 ≈ 83.72%
-no-recipient ratio = 1,511,230,747 / 9,283,213,549 ≈ 16.28%
+```
+delivered ratio    = 12,054,818,090 / 14,398,018,519 ≈ 83.73%
+no-recipient ratio =  2,343,200,583 / 14,398,018,519 ≈ 16.27%
 ```
 
-This ratio is consistent with the churn workload. `no_recipient_messages` represents messages routed to offline or no-longer-registered clients. It does not indicate that the relay failed internally.
+The churn workload intentionally sends messages to random peers across the full client population, not just currently online clients. Clients go offline and reconnect continuously. `no_recipient_messages` represents messages routed at a moment when the target was not registered — this is expected behavior in a churn test, not a relay failure.
+
+The 83.73 / 16.27 split is consistent with the previous benchmark (83.72 / 16.28) and confirms that the workload characteristics are stable across runs.
 
 ---
 
 ## 7. Latency Analysis
 
-Final latency metrics:
+### Final latency metrics
 
 | Metric | Value |
 |---|---:|
-| Mean | ~0.047 ms |
-| P50 | ~0.021 ms |
-| P95 | ~0.051 ms |
-| P99 | ~0.119 ms |
-| Std deviation | ~0.739 ms |
+| Mean | 0.0288 ms |
+| P50 | 0.021 ms |
+| P95 | 0.042 ms |
+| P99 | 0.074 ms |
+| Std deviation | 0.275 ms |
 
-### Interpretation
+### Improvement over previous benchmark
 
-The p99 latency of approximately **0.119 ms** means that 99% of successfully delivered messages were processed through the measured server-side delivery path within roughly **119 microseconds**.
+| Metric | Previous | Current | Change |
+|---|---:|---:|---:|
+| Mean | 0.047 ms | 0.029 ms | −38% |
+| P50 | 0.021 ms | 0.021 ms | — |
+| P95 | 0.051 ms | 0.042 ms | −18% |
+| P99 | 0.119 ms | 0.074 ms | **−38%** |
+| Std dev | 0.739 ms | 0.275 ms | **−63%** |
 
-This is very strong for a WebSocket relay maintaining around 20K active connections and processing more than 100K messages/sec.
+The p50 is unchanged (both runs: 0.021 ms). The improvements are concentrated in the tail: p95, p99, and especially standard deviation. This pattern points to reduced latency spikes rather than a change in median path cost.
 
-### Important Latency Definition
+The architectural cause is the switch from the old two-step read path to the current `readMessage()` approach:
 
-The benchmark latency should be described as:
+**Old path:**
+```
+WebSocket read → Go-heap []byte → mem.Buffer clone → relay
+```
 
-> Server-side post-read delivery latency.
+**Current path:**
+```
+conn.Reader() → parse header → allocate exact mem.Buffer → read payload directly in
+```
 
-It is measured from the point where the server has read a WebSocket message and starts processing it, until the relay successfully writes the message to the destination WebSocket connection.
+Removing the intermediate Go-heap allocation eliminates a class of short-lived objects from the GC's scan path. Fewer temporary objects means fewer GC interruptions, which directly reduces latency spikes at the tail.
 
-It includes:
+### What this latency measures
 
-- Protocol parsing.
-- Target extraction.
-- Message cloning.
-- Routing lookup.
-- Enqueueing into the destination outbound queue.
-- Waiting in the outbound queue.
-- WebSocket write on the receiver connection.
+This is **server-side post-read delivery latency**, measured from the point the server completes reading a full WebSocket frame (`recvTime = time.Now()` after `readMessage()` returns), until it successfully writes the message to the destination connection.
 
-It does not include:
+It includes: protocol parsing, target extraction, recipient ID zeroing, routing lookup, `SafePush` enqueue, write pump wait, WebSocket write.
 
-- Sender client to server network latency.
-- Time spent inside `conn.Read()` waiting for a full WebSocket frame.
-- Receiver network latency after the server write.
-- Receiver application processing time.
-- Full client-to-client end-to-end acknowledgment.
+It does **not** include: sender→server network latency, time waiting inside `conn.Reader()` for the full frame, server→receiver network latency, receiver application processing, or end-to-end acknowledgment.
 
-### Latency Stability
+### Latency stability
 
-The most valuable part of the result is not only that p99 latency is low, but that it remains stable over a long run. There is no visible long-term degradation in the p50/p95/p99 latency trend.
+The p50/p95/p99 pattern at the end of the run matches the pattern at early steady-state. There is no visible degradation trend over 38 hours. This confirms:
 
-This suggests that:
-
-- Outbound queues are not accumulating unbounded backlog.
-- Goroutines are not piling up.
-- GC and allocator behavior are not producing worsening latency over time.
-- The relay path remains stable under sustained churn.
+- Outbound queues are not accumulating backlog.
+- GC pressure is not worsening.
+- The routing path remains stable under sustained churn.
 
 ---
 
 ## 8. CPU Analysis
 
-Final CPU metrics:
+### Final CPU metrics
 
 | Metric | Value |
 |---|---:|
-| Average CPU percent | ~558.23% |
-| Recent CPU percent | ~442.63% |
+| Average CPU % (lifetime) | 493.88% |
+| Recent CPU % (200ms sample) | 503.96% |
 | Logical CPUs | 16 |
-| Recent CPU per logical CPU | ~27.66% |
+| Average cores used | ~4.94 |
+| Recent cores used | ~5.04 |
+| Average per-core utilization | ~30.9% |
 
-In Go/Linux CPU metrics, `100%` usually represents one fully used CPU core.
+In Linux/Go CPU reporting, 100% = one fully utilized core. With 16 logical CPUs:
 
-Therefore:
-
-```text
-average CPU ≈ 558% ≈ 5.58 cores
-recent CPU  ≈ 443% ≈ 4.43 cores
+```
+avg    ≈ 493.9% ≈ 4.9 cores  (30.9% average per-core)
+recent ≈ 504.0% ≈ 5.0 cores  (31.5% per-core)
 ```
 
-With 16 logical CPUs available, the relay server still had meaningful CPU headroom.
+~11 cores are idle. The relay server is not CPU-saturated at ~87K delivered messages/second.
 
-### Interpretation
+### Why CPU usage is low relative to throughput
 
-At more than **104K processed messages/sec**, using approximately **4.4–5.6 logical CPU cores** is efficient. It suggests that the current bottleneck is not simply raw CPU exhaustion.
-
-The remaining headroom is especially notable because the relay server and load generator were running on the same machine. If moved to separate machines, the relay server may have more available CPU, though LAN bandwidth may become the next limiting factor.
+See Architecture §6.11 and §6.10: idle write pump goroutines block on channel receive and consume no CPU thread time. Go's M:N scheduler parks them without occupying OS threads. Each additional idle connection adds essentially zero CPU cost. This allows tens of thousands of mostly-idle connections to coexist with low aggregate CPU consumption.
 
 ---
 
-## 9. Goroutine Lifecycle Analysis
+## 9. Goroutine Lifecycle
 
-Final goroutine metrics:
-
-```text
-active_connections = 20,942
-goroutines         = 41,894
+```
+active_connections = 20,886
+goroutines         = 41,780
+ratio              = 41,780 / 20,886 ≈ 2.00 goroutines/connection
 ```
 
-Ratio:
+The ratio is exactly 2.00, matching the expected model: one read pump goroutine and one write pump goroutine per connection, plus a small fixed overhead for the relayer's background workers and the HTTP server.
 
-```text
-41,894 / 20,942 ≈ 2.00 goroutines per connection
-```
-
-### Interpretation
-
-This is a very healthy result.
-
-It suggests the server is maintaining approximately:
-
-```text
-1 read goroutine + 1 write goroutine per connection
-```
-
-There is no obvious goroutine leak and no sign of unbounded goroutine-per-message accumulation.
-
-For a WebSocket relay, this is one of the strongest lifecycle indicators in the benchmark.
+This ratio has been stable at ≈ 2.00 throughout the run, including during connection churn. Goroutine counts rise and fall with `active_connections`, confirming that there is no goroutine leak from orphaned read/write pumps after disconnect.
 
 ---
 
 ## 10. Memory Analysis
 
-Final memory metrics:
+### Per-connection breakdown (steady state)
 
 | Metric | Value |
 |---|---:|
-| Live heap / `alloc_bytes` | ~1.10 GB |
-| Go `sys_bytes` | ~2.03 GB |
-| Heap objects | ~4.24M |
-| Total allocation / `total_alloc_bytes` | ~61.73 TB |
+| Process RSS per connection | 96.92 KB |
+| Go heap allocated per connection | 47.16 KB |
+| Process RSS total | ~2.07 GB |
+| Go `sys_bytes` | ~2.29 GB |
+| Live heap (`alloc_bytes`) | ~0.96 GB |
+| Go `heap_objects` | 6,420,541 |
 
-### Total Allocation vs Live Memory
+The ~97 KB/connection RSS is composed of:
+- **Goroutine stacks** (two goroutines per connection)
+- **`outChan` buffer slots** (256 slots × `OutMessage` struct size)
+- **`WSConnector` struct** and runtime metadata
+- **Connection registry entry** in `sync.Map`
+- **Kernel socket buffers** (TCP send/receive)
 
-At the final snapshot:
+The `go_alloc_per_conn_kb` (47 KB) component oscillates with GC cycles rather than being a stable floor — it represents the fraction of Go heap attributable to live per-connection objects at the moment of the sample.
 
-```text
-TotalAlloc ≈ 61.73 TB
-Live heap  ≈ 1.10 GB
-Go Sys     ≈ 2.03 GB
+### Process RSS vs Go Sys
+
+```
+Process RSS     ≈ 2.07 GB  (physical pages mapped, from /proc/PID/status)
+Go sys_bytes    ≈ 2.29 GB  (virtual memory reserved by the Go runtime)
 ```
 
-This is the most important memory conclusion.
+RSS is lower than `sys_bytes` because the Go runtime reserves virtual address space in advance but not all pages are necessarily resident. The RSS represents actual physical memory in use.
 
-The server moved through more than **61 TB of cumulative allocation**, but it did not hold that memory. Live heap remained around **~1 GB**, and Go runtime memory obtained from the OS stayed around **~2 GB**.
+Both metrics plateaued early in the run and remained flat for 38 hours, confirming no memory leak.
 
-Average allocation rate:
+### Live heap vs total allocation
 
-```text
-61,733,912,224,320 bytes / 88,781.73s
-≈ 695 MB/s
+```
+Live heap (alloc_bytes)  ≈  0.96 GB  (in use at snapshot time)
+Total allocated ever     ≈ 28.14 TB  (cumulative counter, never decreases)
 ```
 
-This means the system handled nearly **700 MB/s allocation churn** for almost 25 hours without visible memory expansion.
+`TotalAlloc` only increases. It accumulates every allocation ever made, including objects that were created and then garbage collected seconds later. It does not represent memory the server held simultaneously.
 
-### Interpretation
-
-`TotalAlloc` is a cumulative counter. It only increases. It does not decrease when objects are garbage collected or memory spans are reused.
-
-Therefore:
-
-```text
-High TotalAlloc does not mean high live memory.
-High TotalAlloc does not mean the OS physically allocated 61 TB of RAM.
-High TotalAlloc mainly reflects temporary allocation churn caused by high message throughput.
+Allocation rate:
+```
+28,141,107,340,064 / 137,681.38 ≈ 195 MB/s
 ```
 
-The relevant indicators for leak analysis are:
+### Comparison with previous benchmark
 
-- `alloc_bytes` / live heap.
-- `sys_bytes`.
-- heap object count.
-- GC pause behavior.
-- RSS if available.
-- latency tail.
-- whether these metrics grow linearly over time.
+| Metric | Previous run | This run |
+|---|---:|---:|
+| Allocation rate | ~663 MB/s | ~195 MB/s |
+| TotalAlloc (cumulative) | 61.73 TB | 28.14 TB |
+| Live heap (alloc_bytes) | ~1.10 GB | ~0.96 GB |
+| Go sys_bytes | ~2.03 GB | ~2.29 GB |
+| Process RSS total | not measured | ~2.07 GB |
 
-In this benchmark, `sys_bytes` plateaued around **2.03 GB**, while live heap remained around **~1 GB**. This is strong evidence that the runtime and OS are reusing a stable working set effectively.
+**The 71% reduction in allocation rate** is the clearest memory-level evidence of the `readMessage()` improvement. The old path allocated a Go-heap `[]byte` for every received frame to hold the raw WebSocket bytes, then copied into a jemalloc-backed `mem.Buffer`. The current path reads directly from `conn.Reader()` into a precisely-sized `mem.Buffer`. This eliminates the temporary Go-heap slice — one of the highest-frequency allocations in the old hot path.
 
-### Important Allocation Note
+The GC still runs regularly (live heap oscillates from ~800 MB to ~1.5 GB between samples), but it has far less garbage to collect per unit of time.
 
-Memory allocation should not be understood as the OS physically allocating and writing every byte every time the application calls `make` or creates a new object.
+### `sys_bytes` is higher in this run
 
-In Go, most small and medium object allocations are handled by the Go runtime allocator. The runtime uses arenas, spans, size classes, per-P caches, central lists, and heap metadata. Once the heap or working set has grown to a stable size, many allocations are mostly allocator metadata operations: taking a block from a free list, updating span metadata, updating counters, and returning a pointer or slice header to the program.
-
-On the fast path, these operations can be close to O(1) or amortized O(1). They are not necessarily linear in the total number of bytes ever allocated.
-
-Linear cost appears when the program actually touches, zeros, copies, writes, or scans memory. For example, copying a 64KB payload is O(n) in the payload size. But an allocation counter increasing by 64KB does not automatically mean the OS physically allocated and wrote 64KB of new RAM at that moment.
-
-This distinction is crucial when interpreting high-throughput Go benchmark results.
+`sys_bytes` increased from ~2.03 GB (previous) to ~2.29 GB (current). This is not a regression. `sys_bytes` is virtual memory reserved from the OS by the Go runtime; it does not shrink automatically between GC cycles. The value stabilized early and held flat, so the slightly higher plateau likely reflects the runtime allocating somewhat more arena space for the larger total allocation volume in a longer run, or a difference in the initial startup phase.
 
 ---
 
-## 11. What This Benchmark Proves
+## 11. GC Behavior
 
-This benchmark gives strong evidence for the following:
+`alloc_bytes` oscillates between ~800 MB and ~1.5 GB across 3-minute sample intervals, while `sys_bytes` stays fixed and RSS stays flat. This is the expected GC pattern:
 
-### 11.1 The Relay Fast Path Is Efficient
+- Short-lived objects (routing temporaries, `OutMessage` value copies, channel metadata) are allocated and collected each cycle.
+- `sys_bytes` stays fixed because the runtime holds virtual pages in reserve for the next allocation burst.
+- RSS stays flat because jemalloc-backed `mem.Buffer` allocations — the dominant per-message memory — are freed deterministically via `Release()` when the last write pump finishes, independent of GC timing.
 
-The server can route and deliver messages at more than **100K processed messages/sec** while maintaining p99 latency around **0.12 ms**.
-
-### 11.2 Long-Run Stability Is Good
-
-The system ran for nearly **25 hours** without visible degradation in throughput, latency, goroutine count, or memory usage.
-
-### 11.3 Memory Behavior Is Healthy
-
-Despite more than **61 TB** of cumulative allocation, live heap stayed around **~1 GB** and Go `Sys` stayed around **~2 GB**.
-
-This indicates high allocation churn, but no observable memory leak within the benchmark window.
-
-### 11.4 Goroutine Lifecycle Is Clean
-
-The goroutine count stayed near **2 × active_connections**, matching the expected read/write loop model.
-
-### 11.5 Metrics Accounting Is Clean
-
-The final accounting is exact:
-
-```text
-processed_messages = delivered_messages + no_recipient_messages
-```
-
-This gives confidence that the benchmark metrics are internally consistent.
+`heap_objects` oscillates between 2–16 million, confirming the GC is cycling actively. Neither `alloc_bytes` nor RSS trend upward, confirming that buffer ownership is leak-free.
 
 ---
 
-## 12. What This Benchmark Does Not Yet Prove
+## 12. What This Benchmark Proves
 
-This result is strong, but it should not be overstated. It is still a local benchmark and does not fully prove production readiness.
+### 12.1. The Relay Fast Path Is Efficient
 
-It does not yet prove:
+The server routes and delivers ~88K messages/second while maintaining p99 latency of 0.074 ms. On a shared single machine, with CPU split between server and load generator.
 
-- Performance over a real LAN or WAN.
-- Behavior under TLS/WSS.
-- Behavior under slow receivers.
-- Behavior under hotspot traffic, where many senders target one receiver.
-- Fan-out behavior, where one message targets many receivers.
-- p999/p9999 latency behavior.
-- Max latency behavior.
-- Kernel/network/NIC bottleneck behavior.
-- Behavior under packet loss, unstable networks, or mobile clients.
-- Production-grade authentication, authorization, abuse protection, or rate limiting.
+### 12.2. Long-Run Stability Is Strong
 
-These should be tested separately before making production-grade claims.
+38.24 hours of continuous operation with no degradation in throughput, latency, goroutine count, or RSS. This is the first benchmark run long enough to detect slow memory growth or goroutine accumulation at practical timescales.
+
+### 12.3. Memory Per Connection Is Bounded and Predictable
+
+~97 KB/connection RSS at steady state, stable across the full run. This enables capacity planning: a server with 32 GB RAM has headroom for roughly 300,000 connections at this per-connection cost before RAM becomes the constraint.
+
+### 12.4. Architectural Improvement Is Measurable
+
+The switch to `readMessage()` (incremental read, exact-size allocation, no intermediate Go-heap clone) produced quantifiable improvements: −71% allocation rate, −38% p99 latency, −63% latency std deviation. These are not micro-benchmark results; they are observed in a 38-hour production-workload simulation.
+
+### 12.5. Goroutine Lifecycle Is Clean
+
+goroutines ≈ 2 × active_connections throughout churn. No leaked goroutines from disconnected clients.
+
+### 12.6. Delivery Accounting Is Consistent
+
+`delivered + no_recipient ≈ processed` with a residual of 154 messages across 14.4 billion — a gap attributable to connection-close drain behavior, not a logic error.
 
 ---
 
-## 13. LAN Test Implications
+## 13. What This Benchmark Does Not Yet Prove
 
-For payloads around 512B–2KB, a rough average payload estimate is:
+The result is strong, but it remains a local single-machine test. It does not yet prove:
 
-```text
-payload avg ≈ (512B + 2048B) / 2 = 1280B
-protocol overhead ≈ 69B
-message avg ≈ 1349B
+- **Separated network performance.** Server and generator share loopback. Real LAN/WAN adds round-trip latency and may reveal network or NIC saturation.
+- **TLS/WSS overhead.** All connections are unencrypted in this run.
+- **Slow-receiver behavior.** The churn workload generates clients with approximately equal send/receive rates. A workload with many slow receivers (outChan filling up) would stress the drop-on-full path.
+- **Hot-spot fanout.** Many senders targeting one receiver. This creates per-connection write pump backpressure at a specific destination.
+- **High fan-out per message.** `MaxTargetsPerMessage = 10`. A workload that saturates this would change the delivered/processed ratio and memory multiplier.
+- **p999 / max latency** and behavior during GC stop-the-world events.
+- **Production auth, rate limiting, and abuse protection.**
+- **Behavior under packet loss or unstable client connections.**
+
+---
+
+## 14. Network Headroom
+
+For a rough estimate, using the churn test's implied payload distribution and the protocol layout (`FromID(32) | ToIDsLen(1) | ToIDs(N×32) | DataLen(4) | Data`):
+
+If the average payload is ~1 KB (consistent with MPC/signing use cases):
+
+```
+ingress ≈ 104,575 × (32 + 1 + 32 + 4 + 1024) B
+        ≈ 104,575 × 1093 B
+        ≈ 114 MB/s   ≈ 0.91 Gbps
+
+egress  ≈  87,556 × (32 + 1 + 0 + 4 + 1024) B   (ToIDs zeroed by ZeroToIDs)
+        ≈  87,556 × 1061 B
+        ≈  92 MB/s   ≈ 0.74 Gbps
 ```
 
-At approximately **104.5K processed messages/sec**:
+Total logical traffic: **~1.65 Gbps** before TCP/WebSocket framing overhead.
 
-```text
-ingress ≈ 104,562 × 1349B
-        ≈ 141 MB/s
-        ≈ 1.13 Gbps
-```
-
-At approximately **87.5K delivered messages/sec**:
-
-```text
-egress ≈ 87,540 × 1349B
-       ≈ 118 MB/s
-       ≈ 0.94 Gbps
-```
-
-Total logical traffic is roughly:
-
-```text
-~2.07 Gbps before TCP/WebSocket overhead
-```
-
-### Practical Network Implication
-
-| Network | Expected Result |
+| Network | Assessment |
 |---|---|
-| 1GbE | Likely bottleneck |
-| 2.5GbE | Possible, but may be close to saturation |
-| 10GbE | Suitable for measuring higher server ceiling |
-| Wi-Fi | Likely bottleneck before server core |
+| 1 GbE | Near saturation — likely to become bottleneck |
+| 2.5 GbE | Feasible, but limited headroom for burst |
+| 10 GbE | Sufficient to measure the server's true ceiling |
+| Wi-Fi | Will bottleneck before server core |
 
-For LAN testing, **2.5GbE is the minimum reasonable target**, and **10GbE is preferred** if the goal is to measure the relay server ceiling rather than the network ceiling.
+For a separated multi-machine test targeting server throughput ceiling, 10 GbE is the recommended minimum.
 
 ---
 
-## 14. Overall Assessment
+## 15. Overall Assessment
 
-The relay server sustained approximately **104.5K processed messages/sec** for nearly **25 hours**, processing **9.28B messages** with **p99 server-side delivery latency around 0.119 ms**.
+The relay server sustained **~104.6K processed messages/second** and **~87.6K delivered messages/second** for **38.24 hours** against a continuous churn workload. It processed **14.4 billion messages** with **p99 server-side delivery latency of 0.074 ms**, **~97 KB RSS per connection**, and **~5 of 16 CPU cores** in use.
 
-Live heap stayed around **~1 GB**, Go `Sys` memory plateaued around **~2 GB**, and goroutine count stayed near **2 × active_connections**. Despite **~61.73 TB cumulative allocation**, there was no observable memory leak during the benchmark window.
+Compared to the previous 25-hour benchmark, the new `readMessage()` read path produced measurable improvements in latency tail and allocation efficiency. The 71% reduction in allocation rate directly reflects the elimination of an intermediate Go-heap buffer on the hot path.
 
-This is an impressive long-run endurance benchmark and demonstrates strong engineering quality in:
+The system ran for 38 hours with no observable goroutine leak, no RSS growth, and clean delivery accounting. This is strong evidence of production-quality stability at the architectural level.
 
-- Go concurrency.
-- WebSocket relay design.
-- High-throughput message routing.
-- Runtime/memory behavior analysis.
-- Load testing discipline.
-- Long-running systems stability.
+The next meaningful tests are: separated multi-machine setup to remove the shared-resource constraint, TLS, and targeted stress tests for slow-receiver and high-fanout workloads.
