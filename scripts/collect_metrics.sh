@@ -22,7 +22,7 @@
 
 URL="${URL:-http://localhost:8080/metrics}"
 OUTPUT_FILE="${OUTPUT_FILE:-churn_test_benchmark.md}"
-INTERVAL="${INTERVAL:-5}"
+INTERVAL="${INTERVAL:-180}"
 PROCESS_PATTERN="${PROCESS_PATTERN:-bin/relayer}"
 
 echo "Collecting metrics from $URL every $INTERVAL seconds..."
