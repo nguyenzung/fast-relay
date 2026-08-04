@@ -1,4 +1,4 @@
-package core
+package domains
 
 import (
 	"log"
@@ -9,6 +9,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/nguyenzung/relayer-server/internal/core"
+	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
 // Relayer manages a global registry of connectors keyed by pubKey.
@@ -80,31 +83,31 @@ func (r *Relayer) Close() {
 	r.latencyWg.Wait()
 }
 
-// Register adds a connector into the global registry.
-func (r *Relayer) Register(pubKey [32]byte, c Connector) {
+// OnConnect adds a connector into the global registry.
+func (r *Relayer) OnConnect(pubKey [32]byte, c core.Connector) {
 	r.logger.Debug("Registering connector", "pub", pubKey)
 	r.connectors.Store(pubKey, c)
 }
 
-// Unregister removes a connector from the global registry.
-func (r *Relayer) Unregister(pubKey [32]byte) {
+// OnDisconnect removes a connector from the global registry.
+func (r *Relayer) OnDisconnect(pubKey [32]byte) {
 	r.logger.Debug("Unregistering connector", "pub", pubKey)
 	r.connectors.Delete(pubKey)
 }
 
-// Get returns the Connector registered under pubKey.
-func (r *Relayer) Get(pubKey [32]byte) (Connector, bool) {
+// GetConnectorByKey returns the Connector registered under pubKey.
+func (r *Relayer) GetConnectorByKey(pubKey [32]byte) (core.Connector, bool) {
 	v, ok := r.connectors.Load(pubKey)
 	if !ok {
 		return nil, false
 	}
-	return v.(Connector), true
+	return v.(core.Connector), true
 }
 
 // Range iterates over all connectors.
-func (r *Relayer) Range(fn func(pub [32]byte, c Connector) bool) {
+func (r *Relayer) Range(fn func(pub [32]byte, c core.Connector) bool) {
 	r.connectors.Range(func(k, v interface{}) bool {
-		return fn(k.([32]byte), v.(Connector))
+		return fn(k.([32]byte), v.(core.Connector))
 	})
 }
 
@@ -116,6 +119,59 @@ func (r *Relayer) Count() int {
 		return true
 	})
 	return count
+}
+
+// HandleMessage implements core.App: it is the default targeted-multicast
+// routing decision. Recipients are read from msg.ToIDs (self excluded); if
+// none remain after filtering, the message is dropped without incrementing
+// processed. Otherwise the recipient list is zeroed in-place (privacy) and
+// the message is pushed to each resolved connector.
+func (r *Relayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
+	self := from.ID()
+	nTo := int(msg.ToIDsLen())
+
+	var targets [core.MaxTargetsPerMessage][32]byte
+	targetN := 0
+	for i := 0; i < nTo; i++ {
+		id := msg.ToIDAt(i)
+		if id == self {
+			continue
+		}
+		targets[targetN] = id
+		targetN++
+	}
+
+	if targetN == 0 {
+		buf.Release()
+		return
+	}
+
+	r.IncrementProcessed()
+	// ZeroToIDs zeros m[33:33+N*32] in-place. ToIDsLen (m[32]) and
+	// DataLen/Data offsets are untouched, so the protocol layout stays valid.
+	msg.ZeroToIDs()
+
+	matched := 0
+	for _, target := range targets[:targetN] {
+		if dest, ok := r.GetConnectorByKey(target); ok {
+			// Retain before each push so the write pump can Release independently.
+			buf.Retain()
+			outMsg := core.OutMessage{Msg: msg, RecvTime: recvTime, Buf: buf}
+			if dest.SafePush(outMsg) {
+				matched++
+			} else {
+				r.IncrementNoRecipient()
+				buf.Release() // push dropped, undo retain
+			}
+		}
+	}
+
+	// Release the initial ref from NewBuffer.
+	buf.Release()
+
+	if matched == 0 {
+		r.IncrementNoRecipient()
+	}
 }
 
 // --- Atomic Counter Helpers for Hot Path ---

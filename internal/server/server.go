@@ -63,7 +63,7 @@ func (reg *DefaultRegistrar) Register(r *http.Request) (*AuthResult, error) {
 
 // Server wraps HTTP server and relayer and exposes monitoring endpoints.
 type Server struct {
-	rel       *core.Relayer
+	app       core.App
 	h         *http.ServeMux
 	srv       *http.Server
 	outBuf    int
@@ -76,7 +76,7 @@ type Server struct {
 	registrar Registrar
 }
 
-func NewServer(addr string, outBuf int, auth Authenticator, reg Registrar) *Server {
+func NewServer(addr string, outBuf int, auth Authenticator, reg Registrar, app core.App) *Server {
 	if auth == nil {
 		auth = &DefaultAuthenticator{}
 	}
@@ -84,10 +84,9 @@ func NewServer(addr string, outBuf int, auth Authenticator, reg Registrar) *Serv
 		reg = &DefaultRegistrar{}
 	}
 
-	rel := core.NewRelayer()
 	h := http.NewServeMux()
 	s := &Server{
-		rel:         rel,
+		app:         app,
 		h:           h,
 		outBuf:      outBuf,
 		startTime:   time.Now(),
@@ -158,8 +157,8 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	const readLimit = 512 * 1024
 	conn.SetReadLimit(readLimit)
 
-	c := network.NewWSConnector(conn, authResult.PubKey, s.rel, s.outBuf)
-	s.rel.Register(authResult.PubKey, c)
+	c := network.NewWSConnector(conn, authResult.PubKey, s.app, s.outBuf)
+	s.app.OnConnect(authResult.PubKey, c)
 
 	if err := c.ReadWriteLoop(r.Context()); err != nil {
 		// log.Printf("ReadLoop exited for pub=%s err=%v", pub, err)
@@ -206,15 +205,15 @@ func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m := map[string]interface{}{
-		"active_connections":         s.rel.Count(),
+		"active_connections":         s.app.Count(),
 		"goroutines":                 runtime.NumGoroutine(),
 		"alloc_bytes":                ms.Alloc,
 		"total_alloc_bytes":          ms.TotalAlloc,
 		"sys_bytes":                  ms.Sys,
 		"heap_objects":               ms.HeapObjects,
-		"processed_messages":         s.rel.Processed(),
-		"delivered_messages":         s.rel.Delivered(),
-		"no_recipient_messages":      s.rel.NoRecipient(),
+		"processed_messages":         s.app.Processed(),
+		"delivered_messages":         s.app.Delivered(),
+		"no_recipient_messages":      s.app.NoRecipient(),
 		"cpu_seconds":                totalCPU,
 		"cpu_percent":                cpuPercent,
 		"cpu_recent_percent":         cpuRecent,
@@ -224,7 +223,7 @@ func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// add latency snapshot (ms)
-	if cnt, meanMs, stdMs, p50, p95, p99 := s.rel.LatencySnapshot(); cnt > 0 {
+	if cnt, meanMs, stdMs, p50, p95, p99 := s.app.LatencySnapshot(); cnt > 0 {
 		m["latency_count"] = cnt
 		m["latency_mean_ms"] = meanMs
 		m["latency_std_ms"] = stdMs
@@ -252,8 +251,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// stop sampler
 	close(s.stopSampler)
 	// close relayer to flush latency worker and other background tasks
-	if s.rel != nil {
-		s.rel.Close()
+	if s.app != nil {
+		s.app.Close()
 	}
 	return s.srv.Shutdown(ctx)
 }
