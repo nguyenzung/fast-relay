@@ -8,12 +8,15 @@ This document details the architecture of the **Relay Server**, how its componen
 
 Relay Server is a message broker server following the **Pub/Sub** or **Targeted Multicast** model via WebSocket connections. Clients connect to the server, identified by a public key (`PubKey` — 32 bytes), and send binary messages to one or more destination `PubKey`s.
 
-The system is divided into 4 distinct layers:
+The transport and connection-handling plumbing (`internal/network`, `internal/server`) does not depend on the relay's concrete routing logic — it depends only on the `core.App` interface (§2.2), including the routing decision itself (`App.HandleMessage`, §2.2). The currently shipped app, `domains.Relayer`, implements targeted multicast, but any type implementing `core.App` can be substituted at the entrypoint (see `cmd/relayer/main.go`) to reuse the same transport, buffer management, and HTTP layer for a different kind of application — e.g. a server-authoritative game server where clients send input to the server for processing rather than to each other, and `HandleMessage` runs game logic instead of a target lookup.
+
+The system is divided into 5 distinct layers:
 
 | Layer | Package | Responsibility |
 |---|---|---|
 | Memory | `internal/mem` | Platform-specific allocator abstraction |
-| Core | `internal/core` | Routing logic, state management, metrics |
+| Core | `internal/core` | Connector/message primitives, `App` contract |
+| Domains | `internal/domains` | Concrete `App` implementations (routing logic, state, metrics) |
 | Network | `internal/network` | WebSocket adapter; byte streams ↔ core types |
 | Server | `internal/server` | HTTP server, endpoints, authentication |
 
@@ -41,12 +44,14 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 
 ### 2.2. Core Layer (`internal/core`)
 
-- **`Relayer` (`relayer.go`)**:
-  - **Registry**: Manages active connections using `sync.Map`, optimized for read-heavy workloads where routing lookups greatly outnumber register/unregister events.
-  - **Metrics**: `atomic.Uint64` counters (`processed`, `delivered`, `noRecip`) avoid mutex contention on the hot path.
-  - **Latency Monitoring**: A background worker collects latency samples. Uses the Welford algorithm for online mean/variance and **Reservoir Sampling** (fixed sample size) to approximate percentiles (p50, p95, p99) with bounded memory.
+- **`App` Interface (`app.go`)**: The pluggability seam of the system. `internal/network` and `internal/server` depend only on this interface, never on a concrete app type:
+  - **Connection lifecycle**: `OnConnect(pubKey, connector)`, `OnDisconnect(pubKey)`, `Count()`, `Range(fn)`.
+  - **Routing (the seam)**: `HandleMessage(from, msg, buf, recvTime)` — called once per successfully framed inbound message. The App owns the entire routing decision: which recipients (if any) receive it, whether/how the recipient list is stripped before forwarding, and which counters apply. The App takes ownership of `buf` and must release it. `internal/network` calls this and otherwise has no opinion on what a message means.
+  - **Metrics**: `IncrementDelivered/NoRecipient()`, `Processed/Delivered/NoRecipient()`, `RecordLatency(d)`, `LatencySnapshot()`. (`IncrementProcessed` and the connector registry lookup are implementation details of each `App` — see §2.3 — not part of this interface, since only the App's own `HandleMessage` needs them.)
+  - **Shutdown**: `Close()`.
+  - Any type satisfying `App` can be constructed at the entrypoint and injected into `server.NewServer(...)` in place of the relayer.
 
-- **`Connector` Interface (`connector.go`)**: Defines `ID()`, `SafePush()`, and `Close()`. Any protocol adapter plugging into `Relayer` must implement this interface.
+- **`Connector` Interface (`connector.go`)**: Defines `ID()`, `SafePush()`, and `Close()`. Any protocol adapter plugging into an `App` must implement this interface.
 
 - **`Message` (`message.go`)**: A `[]byte` view over the raw buffer. Helper methods (`ToIDsLen()`, `ToIDAt()`, `ZeroToIDs()`) operate directly on fixed byte offsets, with no struct allocation or deserialization.
 
@@ -54,29 +59,41 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 
 ---
 
-### 2.3. Network Layer (`internal/network`)
+### 2.3. Domains Layer (`internal/domains`)
 
-**`WSConnector` (`ws_connector.go`)**: Implements `core.Connector` using `github.com/coder/websocket`.
+Concrete `App` implementations live here, outside `internal/core`. Adding a new application type — including one with entirely different routing semantics — never requires touching `internal/core`, `internal/network`, or `internal/server`: only adding a new file to this package (implementing `core.App`, in particular `HandleMessage`) and wiring it up in a new `cmd/<name>/main.go`.
+
+- **`Relayer` (`relayer.go`)**: The default implementation of `core.App`, providing targeted multicast — one of potentially several `App`s this package can hold:
+  - **Registry**: Manages active connections using `sync.Map`, optimized for read-heavy workloads where routing lookups greatly outnumber register/unregister events. `OnConnect`/`OnDisconnect` are backed by this map; `GetConnectorByKey` is a private-to-the-package lookup helper used only by `HandleMessage` below (it is not part of `core.App`).
+  - **`HandleMessage`**: The routing decision itself. Reads recipients from `msg.ToIDs` (via `core.Message` helpers), excludes the sender, and drops the frame without counting it as `processed` if no recipients remain. Otherwise increments `processed`, zeroes the recipient list in-place (`ZeroToIDs`, for privacy — recipients forwarded to a peer should not see who else received it), looks up each target via the registry, and pushes to `dest.SafePush(...)`, retaining/releasing `buf`'s refcount per recipient. A different `App` (e.g. a game server) would implement this same method differently — for instance ignoring `ToIDs` entirely and routing through server-side game state instead of a peer registry — without needing any of the above.
+  - **Metrics**: `atomic.Uint64` counters (`processed`, `delivered`, `noRecip`) avoid mutex contention on the hot path.
+  - **Latency Monitoring**: A background worker collects latency samples. Uses the Welford algorithm for online mean/variance and **Reservoir Sampling** (fixed sample size) to approximate percentiles (p50, p95, p99) with bounded memory.
+
+---
+
+### 2.4. Network Layer (`internal/network`)
+
+**`WSConnector` (`ws_connector.go`)**: Implements `core.Connector` using `github.com/coder/websocket`. It holds a `core.App` reference (`app`), not a concrete relayer type, obtained via `NewWSConnector(conn, pubKey, app, outBufSize)`.
 
 - **Asynchronous I/O**: Each `WSConnector` owns a bounded `outChan` (buffered channel). `SafePush` acquires an `RLock` to coordinate safely with `Close()` — preventing sends into a closed channel — then attempts a non-blocking send. If `outChan` is full, the message is dropped for that destination (*drop-on-full*). The `outChan` capacity is set by the caller of `NewWSConnector`; if `<= 0` it defaults to 256. Both `outChan` capacity and `MaxMessageSize` should be tuned to the expected payload size and burst characteristics of the deployment.
 
 - **ReadWriteLoop**: Each connection maintains two goroutines:
-  - **Read Pump**: Uses `conn.Reader()` and `readMessage()` to incrementally parse the protocol prefix, validate `ToIDsLen` and `DataLen`, allocate one precisely-sized `mem.Buffer`, and read the payload directly into that buffer. Calls `ZeroToIDs()` in-place to strip recipient IDs for privacy, then passes the buffer to `Relay()`.
-  - **Write Pump**: Takes `OutMessage` values from `outChan`, writes to the socket with a 5-second per-write timeout, then calls `msg.Buf.Release()` if `Buf` is non-nil. When the last recipient releases, `C.free` is called immediately. On write error the pump closes the connection and drains remaining queued messages, releasing each buffer before exiting.
+  - **Read Pump**: Uses `conn.Reader()` and `readMessage()` to incrementally parse the fixed wire envelope (`FromID | ToIDsLen | ToIDs | DataLen | Data` — this framing is protocol-level, not app-specific, and stays in this package), allocate one precisely-sized `mem.Buffer`, and read the payload directly into that buffer. The resulting `core.Message` is then handed off whole to `app.HandleMessage(c, msg, buf, recvTime)` — this package does not interpret `ToIDs`/`Data` beyond the fixed envelope offsets; the routing decision belongs entirely to the `App` (§2.3). On disconnect, calls `app.OnDisconnect(pubKey)`.
+  - **Write Pump**: Takes `OutMessage` values from `outChan`, writes to the socket with a 5-second per-write timeout, then calls `msg.Buf.Release()` if `Buf` is non-nil. When the last recipient releases, `C.free` is called immediately. On write error the pump closes the connection, calls `app.IncrementNoRecipient()`, and drains remaining queued messages, releasing each buffer before exiting. On success it calls `app.IncrementDelivered()` and `app.RecordLatency(...)` — these are generic delivery-outcome hooks, not part of the routing decision, so they stay here regardless of which `App` is plugged in.
 
 - **Incremental Read + Exact-size Allocation**: `readMessage()` first reads the small protocol header to learn the exact payload size, then allocates one `mem.Buffer` of that size and reads the payload directly in. This avoids the older pattern of reading into a Go-heap slice and cloning into a `mem.Buffer`. One buffer is shared across all recipients via `Retain`/`Release` reference counting.
 
 ---
 
-### 2.4. Server Layer (`internal/server`)
+### 2.5. Server Layer (`internal/server`)
 
-**`Server` (`server.go`)**: Wraps `http.Server` and `core.Relayer`.
+**`Server` (`server.go`)**: Wraps `http.Server` and a `core.App`, injected via `NewServer(addr, outBuf, auth, reg, app)`. The server itself constructs no app — the concrete `core.App` (e.g. `domains.NewRelayer()`) is built by the entrypoint (`cmd/relayer/main.go`) and passed in, keeping `internal/server` app-agnostic.
 
 - **Pluggable Auth**: Defines `Authenticator` and `Registrar` interfaces. Custom implementations (e.g., JWT, OAuth) can be injected; otherwise defaults are used.
 - **Endpoints**:
   - `GET /` — HTTP upgrade to WebSocket
   - `GET /register` — issue a new identity (PubKey)
-  - `GET /metrics` — JSON metrics (RAM, CPU, goroutines, TPS, latency)
+  - `GET /metrics` — JSON metrics (RAM, CPU, goroutines, TPS, latency) — sourced from `app.Count()`, `app.Processed()/Delivered()/NoRecipient()`, and `app.LatencySnapshot()`
 
 ---
 
@@ -87,14 +104,14 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 1. Client sends `GET /?pub=<HEX_STRING>`.
 2. `Authenticator` validates the `pub`.
 3. HTTP is upgraded to WebSocket.
-4. `WSConnector` is created and registered with `Relayer.Register(pubKey, connector)`.
+4. `WSConnector` is created and registered via `app.OnConnect(pubKey, connector)`.
 
 ### B. Message Routing Phase
 
 1. Client A sends a binary frame.
-2. Read pump parses the frame via `readMessage()`. It then filters the recipient list — removing self and building a deduplicated targets array. If no valid targets remain, the buffer is released and the frame is skipped without incrementing `processed`.
-3. With at least one valid target, `processed` is incremented, `ZeroToIDs()` is called in-place, and `c.Relay()` is called with the pre-filtered targets array.
-4. `Relay()` looks up each target via `Relayer.Get()` and calls `dest.SafePush(msg)` — non-blocking.
+2. Read pump parses the frame via `readMessage()` into a `core.Message` + `mem.Buffer`, then calls `app.HandleMessage(c, msg, buf, recvTime)` — network stops here; everything below is `Relayer`'s (the default `App`) behavior, not network's.
+3. `Relayer.HandleMessage` filters the recipient list — removing self and building a deduplicated targets array. If no valid targets remain, the buffer is released and the frame is skipped without incrementing `processed`.
+4. With at least one valid target, `processed` is incremented, `ZeroToIDs()` is called in-place, and each target is looked up via the internal registry and pushed with `dest.SafePush(msg)` — non-blocking. A different `App` would perform entirely different steps here.
 
 ### C. Delivery Phase
 
@@ -114,6 +131,7 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 | Async delivery | Buffered `outChan` per connection | Routing goroutine never blocks on writes |
 | Slow-client isolation | Drop-on-full at `outChan` | One slow connection cannot stall others |
 | Core/network separation | `core.Connector` interface | Core is testable without a real network |
+| App pluggability | `core.App` interface, implementations in `internal/domains` | `network`/`server` are reusable across different application types without modification |
 
 **Tuning note**: `outChan` capacity (`DefaultOutBufSize`, `MaxOutBufSize`) and `MaxMessageSize` directly trade per-connection memory against burst tolerance. A larger buffer absorbs spikes but increases RSS; `MaxMessageSize` should match real payload sizes to limit memory amplification under load or adversarial input.
 
