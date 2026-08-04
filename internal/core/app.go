@@ -18,9 +18,14 @@ type App interface {
 	// (wire framing is already parsed by internal/network). The App owns the
 	// entire routing decision: which recipients (if any) receive it, whether
 	// the recipient list is stripped before forwarding, and which counters
-	// apply. The App takes ownership of buf and must eventually release it —
-	// directly, or by retaining it into pushed OutMessages so each
-	// recipient's write pump releases its own reference.
+	// apply.
+	//
+	// buf ownership: the caller (internal/network) holds buf's original
+	// reference and releases it right after HandleMessage returns.
+	// HandleMessage must NOT release that reference itself - it may only
+	// Retain() additional references for connectors it pushes to (see
+	// DeliverTo in protocol.go), each released independently by that
+	// recipient's own write pump once written.
 	HandleMessage(from Connector, msg Message, buf *mem.Buffer, recvTime time.Time)
 
 	IncrementNoRecipient()

@@ -192,6 +192,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 		}
 
 		buf, err := readMessage(r, core.MaxMessageSize)
+
 		// recvTime captured after full message is in memory — equivalent to conn.Read() semantics.
 		recvTime := time.Now()
 		if errors.Is(err, errSkipMessage) {
@@ -212,5 +213,6 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 		// nTo already validated (1..core.MaxTargetsPerMessage) inside readMessage.
 		msg := core.Message(buf.Bytes())
 		c.app.HandleMessage(c, msg, buf, recvTime)
+		buf.Release()
 	}
 }

@@ -122,27 +122,18 @@ func (r *Relayer) Count() int {
 }
 
 // HandleMessage implements core.App: it is the default targeted-multicast
-// routing decision. Recipients are read from msg.ToIDs (self excluded); if
-// none remain after filtering, the message is dropped without incrementing
-// processed. Otherwise the recipient list is zeroed in-place (privacy) and
-// the message is pushed to each resolved connector.
+// routing decision, composed from shared protocol primitives
+// (core.ExtractTargets, core.DeliverTo - see internal/core/protocol.go) plus
+// Relayer's own policy: self is excluded via ExtractTargets; if no targets
+// remain, the message is dropped without incrementing processed. Otherwise
+// the recipient list is zeroed in-place (privacy, Relayer-specific) and the
+// message is pushed to each resolved connector via DeliverTo. A different
+// App can reuse the same two primitives with its own policy on top.
 func (r *Relayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
-	self := from.ID()
-	nTo := int(msg.ToIDsLen())
-
 	var targets [core.MaxTargetsPerMessage][32]byte
-	targetN := 0
-	for i := 0; i < nTo; i++ {
-		id := msg.ToIDAt(i)
-		if id == self {
-			continue
-		}
-		targets[targetN] = id
-		targetN++
-	}
+	targetN := core.ExtractTargets(msg, from.ID(), &targets)
 
 	if targetN == 0 {
-		buf.Release()
 		return
 	}
 
@@ -154,20 +145,13 @@ func (r *Relayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.
 	matched := 0
 	for _, target := range targets[:targetN] {
 		if dest, ok := r.GetConnectorByKey(target); ok {
-			// Retain before each push so the write pump can Release independently.
-			buf.Retain()
-			outMsg := core.OutMessage{Msg: msg, RecvTime: recvTime, Buf: buf}
-			if dest.SafePush(outMsg) {
+			if core.DeliverTo(dest, msg, buf, recvTime) {
 				matched++
 			} else {
 				r.IncrementNoRecipient()
-				buf.Release() // push dropped, undo retain
 			}
 		}
 	}
-
-	// Release the initial ref from NewBuffer.
-	buf.Release()
 
 	if matched == 0 {
 		r.IncrementNoRecipient()
