@@ -46,7 +46,7 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 
 - **`App` Interface (`app.go`)**: The pluggability seam of the system. `internal/network` and `internal/server` depend only on this interface, never on a concrete app type:
   - **Connection lifecycle**: `OnConnect(pubKey, connector)`, `OnDisconnect(pubKey)`, `Count()`, `Range(fn)`.
-  - **Routing (the seam)**: `HandleMessage(from, msg, buf, recvTime)` — called once per successfully framed inbound message. The App owns the entire routing decision: which recipients (if any) receive it, whether/how the recipient list is stripped before forwarding, and which counters apply. The App takes ownership of `buf` and must release it. `internal/network` calls this and otherwise has no opinion on what a message means.
+  - **Routing (the seam)**: `HandleMessage(from, msg, buf, recvTime)` — called once per successfully framed inbound message. The App owns the entire routing decision: which recipients (if any) receive it, whether/how the recipient list is stripped before forwarding, and which counters apply. `internal/network` calls this and otherwise has no opinion on what a message means. `buf` ownership stays with the caller: `internal/network` holds the original reference from `readMessage()` and releases it right after `HandleMessage` returns; `HandleMessage` must not release that reference itself, only `Retain()` additional ones (via `DeliverTo`, see below) for each connector it pushes to.
   - **Metrics**: `IncrementDelivered/NoRecipient()`, `Processed/Delivered/NoRecipient()`, `RecordLatency(d)`, `LatencySnapshot()`. (`IncrementProcessed` and the connector registry lookup are implementation details of each `App` — see §2.3 — not part of this interface, since only the App's own `HandleMessage` needs them.)
   - **Shutdown**: `Close()`.
   - Any type satisfying `App` can be constructed at the entrypoint and injected into `server.NewServer(...)` in place of the relayer.
@@ -57,6 +57,11 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 
 - **`OutMessage` (`message.go`)**: Carries a `Message` and its receive timestamp across channels. Passed by value to avoid a separate pointer allocation per message in the common case. Contains a `Buf *mem.Buffer` field — on Linux this holds the jemalloc-backed region; on other platforms it is nil. Each recipient's write pump calls `Buf.Release()` after writing (nil-safe), and the last release frees the backing memory.
 
+- **Protocol primitives (`protocol.go`)**: Mechanical, policy-free operations shared across `internal/domains` `App` implementations, so each new domain doesn't have to re-derive them:
+  - `ExtractTargets(msg, self, &dst)` — reads `msg.ToIDs`, excludes `self`, writes into a caller-provided fixed array (no allocation).
+  - `DeliverTo(dest, msg, buf, recvTime)` — the retain/push/release-on-drop dance for pushing `msg` to one `Connector`. It only ever manages the reference it creates via its own `Retain()`; it never releases the original reference (that belongs to `internal/network`, see above). This is the easiest place to introduce a refcount bug by hand, so it exists once here instead of being copy-pasted per `App`.
+  - Both are opinion-free: they don't decide what counts as `processed`, whether to strip the recipient list, or which counter to bump on failure — that's still each `App`'s own policy (see §2.3).
+
 ---
 
 ### 2.3. Domains Layer (`internal/domains`)
@@ -65,7 +70,7 @@ Concrete `App` implementations live here, outside `internal/core`. Adding a new 
 
 - **`Relayer` (`relayer.go`)**: The default implementation of `core.App`, providing targeted multicast — one of potentially several `App`s this package can hold:
   - **Registry**: Manages active connections using `sync.Map`, optimized for read-heavy workloads where routing lookups greatly outnumber register/unregister events. `OnConnect`/`OnDisconnect` are backed by this map; `GetConnectorByKey` is a private-to-the-package lookup helper used only by `HandleMessage` below (it is not part of `core.App`).
-  - **`HandleMessage`**: The routing decision itself. Reads recipients from `msg.ToIDs` (via `core.Message` helpers), excludes the sender, and drops the frame without counting it as `processed` if no recipients remain. Otherwise increments `processed`, zeroes the recipient list in-place (`ZeroToIDs`, for privacy — recipients forwarded to a peer should not see who else received it), looks up each target via the registry, and pushes to `dest.SafePush(...)`, retaining/releasing `buf`'s refcount per recipient. A different `App` (e.g. a game server) would implement this same method differently — for instance ignoring `ToIDs` entirely and routing through server-side game state instead of a peer registry — without needing any of the above.
+  - **`HandleMessage`**: The routing decision itself, composed from the shared primitives in §2.2 plus Relayer's own policy: `core.ExtractTargets` reads recipients from `msg.ToIDs` excluding the sender; if none remain, the frame is dropped without counting it as `processed`. Otherwise `processed` is incremented, the recipient list is zeroed in-place (`ZeroToIDs`, for privacy — Relayer-specific policy, not every `App` needs this), each target is looked up via the registry, and `core.DeliverTo` pushes to it. A different `App` (e.g. a game server) can reuse `ExtractTargets`/`DeliverTo` as-is, or ignore them entirely and route through server-side game state instead of a peer registry — the primitives don't force any particular routing semantics.
   - **Metrics**: `atomic.Uint64` counters (`processed`, `delivered`, `noRecip`) avoid mutex contention on the hot path.
   - **Latency Monitoring**: A background worker collects latency samples. Uses the Welford algorithm for online mean/variance and **Reservoir Sampling** (fixed sample size) to approximate percentiles (p50, p95, p99) with bounded memory.
 
@@ -109,9 +114,9 @@ Concrete `App` implementations live here, outside `internal/core`. Adding a new 
 ### B. Message Routing Phase
 
 1. Client A sends a binary frame.
-2. Read pump parses the frame via `readMessage()` into a `core.Message` + `mem.Buffer`, then calls `app.HandleMessage(c, msg, buf, recvTime)` — network stops here; everything below is `Relayer`'s (the default `App`) behavior, not network's.
-3. `Relayer.HandleMessage` filters the recipient list — removing self and building a deduplicated targets array. If no valid targets remain, the buffer is released and the frame is skipped without incrementing `processed`.
-4. With at least one valid target, `processed` is incremented, `ZeroToIDs()` is called in-place, and each target is looked up via the internal registry and pushed with `dest.SafePush(msg)` — non-blocking. A different `App` would perform entirely different steps here.
+2. Read pump parses the frame via `readMessage()` into a `core.Message` + `mem.Buffer`, calls `app.HandleMessage(c, msg, buf, recvTime)` synchronously, then releases its own reference to `buf` — network stops interpreting the message here; everything else below is `Relayer`'s (the default `App`) behavior, not network's.
+3. `Relayer.HandleMessage` (via `core.ExtractTargets`) filters the recipient list — removing self. If no valid targets remain, the frame is skipped without incrementing `processed` (and without touching `buf`'s refcount — see §2.2 on `buf` ownership).
+4. With at least one valid target, `processed` is incremented, `ZeroToIDs()` is called in-place, and each target is looked up via the internal registry and pushed via `core.DeliverTo` — non-blocking. A different `App` would perform entirely different steps here.
 
 ### C. Delivery Phase
 
