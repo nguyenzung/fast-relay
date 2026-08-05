@@ -52,7 +52,35 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
   - **Shutdown**: `Close()`.
   - Any type satisfying `App` can be constructed at the entrypoint and injected into `server.NewServer(...)` in place of the relayer.
 
-- **`Connector` Interface (`connector.go`)**: Defines `ID()`, `SafePush()`, and `Close()`. Any protocol adapter plugging into an `App` must implement this interface.
+  ```go
+  type App interface {
+      OnConnect(pubKey [32]byte, c Connector)
+      OnDisconnect(pubKey [32]byte)
+      HandleMessage(from Connector, msg Message, buf *mem.Buffer, recvTime time.Time)
+      Count() int
+      IncrementDeliverySuccess()
+      IncrementDeliveryFailure()
+      RecordLatency(d time.Duration)
+      Close()
+      Metrics // embedded — see below
+  }
+
+  type Metrics interface {
+      StartRecording()      // called once, before the first FetchMetrics call
+      StopRecording()       // called once during shutdown
+      FetchMetrics() any    // point-in-time snapshot; shape is App-defined
+  }
+  ```
+
+- **`Connector` Interface (`connector.go`)**: Defines `ID()`, `SafePush()`, and `Close()`. Any protocol adapter plugging into an `App` must implement this interface. Implementations must be safe for concurrent use from multiple goroutines; `SafePush` must never block (drop-on-full instead), and `Close` must be idempotent and make every subsequent `SafePush` return `false`.
+
+  ```go
+  type Connector interface {
+      ID() [32]byte
+      SafePush(msg OutMessage) bool
+      Close()
+  }
+  ```
 
 - **`Message` (`message.go`)**: A `[]byte` view over the raw buffer. Helper methods (`ToIDsLen()`, `ToIDAt()`, `ZeroToIDs()`) operate directly on fixed byte offsets, with no struct allocation or deserialization.
 
@@ -95,7 +123,23 @@ Concrete `App` implementations live here, outside `internal/core`. Adding a new 
 
 **`Server` (`server.go`)**: Wraps `http.Server` and a `core.App`, injected via `NewServer(addr, outBuf, auth, reg, app)`. The server itself constructs no app — the concrete `core.App` (e.g. `domains.NewRelayer()`) is built by the entrypoint (`cmd/relayer/main.go`) and passed in, keeping `internal/server` app-agnostic.
 
-- **Pluggable Auth**: Defines `Authenticator` and `Registrar` interfaces. Custom implementations (e.g., JWT, OAuth) can be injected; otherwise defaults are used.
+- **Pluggable Auth**: Defines `Authenticator` and `Registrar` interfaces. Custom implementations (e.g., JWT, OAuth) can be injected via `NewServer(addr, outBuf, auth, reg, app)`; passing `nil` for either falls back to `DefaultAuthenticator`/`DefaultRegistrar` (pubkey-from-query-param, no real identity check — suitable for trusted/dev environments only).
+
+  ```go
+  // Authenticator verifies an inbound WebSocket upgrade request (the "/"
+  // endpoint) and resolves the caller's identity before the connection is
+  // accepted. A non-nil error rejects the upgrade with 400 Bad Request.
+  type Authenticator interface {
+      Authenticate(r *http.Request) (*AuthResult, error)
+  }
+
+  // Registrar handles the "/register" endpoint: it provisions or resolves
+  // an identity for a caller that does not yet have one. A non-nil error
+  // rejects the request with 500 Internal Server Error.
+  type Registrar interface {
+      Register(r *http.Request) (*AuthResult, error)
+  }
+  ```
 - **Endpoints**:
   - `GET /` — HTTP upgrade to WebSocket
   - `GET /register` — issue a new identity (PubKey)
