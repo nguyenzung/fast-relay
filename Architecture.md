@@ -45,9 +45,10 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 ### 2.2. Core Layer (`internal/core`)
 
 - **`App` Interface (`app.go`)**: The pluggability seam of the system. `internal/network` and `internal/server` depend only on this interface, never on a concrete app type:
-  - **Connection lifecycle**: `OnConnect(pubKey, connector)`, `OnDisconnect(pubKey)`, `Count()`, `Range(fn)`.
+  - **Connection lifecycle**: `OnConnect(pubKey, connector)`, `OnDisconnect(pubKey)`, `Count()`.
   - **Routing (the seam)**: `HandleMessage(from, msg, buf, recvTime)` — called once per successfully framed inbound message. The App owns the entire routing decision: which recipients (if any) receive it, whether/how the recipient list is stripped before forwarding, and which counters apply. `internal/network` calls this and otherwise has no opinion on what a message means. `buf` ownership stays with the caller: `internal/network` holds the original reference from `readMessage()` and releases it right after `HandleMessage` returns; `HandleMessage` must not release that reference itself, only `Retain()` additional ones (via `DeliverTo`, see below) for each connector it pushes to.
-  - **Metrics**: `IncrementDelivered/NoRecipient()`, `Processed/Delivered/NoRecipient()`, `RecordLatency(d)`, `LatencySnapshot()`. (`IncrementProcessed` and the connector registry lookup are implementation details of each `App` — see §2.3 — not part of this interface, since only the App's own `HandleMessage` needs them.)
+  - **Delivery-outcome hooks**: `IncrementDeliverySuccess()`, `IncrementDeliveryFailure()`, `RecordLatency(d)`. These are called by the connector write pump after the actual socket write outcome is known.
+  - **Metrics lifecycle/reporting**: `core.App` embeds `Metrics` with `StartRecording()`, `StopRecording()`, `FetchMetrics() any` so `internal/server` can start/stop collection and expose an opaque app-defined snapshot without knowing app internals.
   - **Shutdown**: `Close()`.
   - Any type satisfying `App` can be constructed at the entrypoint and injected into `server.NewServer(...)` in place of the relayer.
 
@@ -84,7 +85,7 @@ Concrete `App` implementations live here, outside `internal/core`. Adding a new 
 
 - **ReadWriteLoop**: Each connection maintains two goroutines:
   - **Read Pump**: Uses `conn.Reader()` and `readMessage()` to incrementally parse the fixed wire envelope (`FromID | ToIDsLen | ToIDs | DataLen | Data` — this framing is protocol-level, not app-specific, and stays in this package), allocate one precisely-sized `mem.Buffer`, and read the payload directly into that buffer. The resulting `core.Message` is then handed off whole to `app.HandleMessage(c, msg, buf, recvTime)` — this package does not interpret `ToIDs`/`Data` beyond the fixed envelope offsets; the routing decision belongs entirely to the `App` (§2.3). On disconnect, calls `app.OnDisconnect(pubKey)`.
-  - **Write Pump**: Takes `OutMessage` values from `outChan`, writes to the socket with a 5-second per-write timeout, then calls `msg.Buf.Release()` if `Buf` is non-nil. When the last recipient releases, `C.free` is called immediately. On write error the pump closes the connection, calls `app.IncrementNoRecipient()`, and drains remaining queued messages, releasing each buffer before exiting. On success it calls `app.IncrementDelivered()` and `app.RecordLatency(...)` — these are generic delivery-outcome hooks, not part of the routing decision, so they stay here regardless of which `App` is plugged in.
+  - **Write Pump**: Takes `OutMessage` values from `outChan`, writes to the socket with a 5-second per-write timeout, then calls `msg.Buf.Release()` if `Buf` is non-nil. When the last recipient releases, `C.free` is called immediately. On write error the pump closes the connection, calls `app.IncrementDeliveryFailure()`, and drains remaining queued messages, releasing each buffer before exiting. On success it calls `app.IncrementDeliverySuccess()` and `app.RecordLatency(...)` — these are generic delivery-outcome hooks, not part of the routing decision, so they stay here regardless of which `App` is plugged in.
 
 - **Incremental Read + Exact-size Allocation**: `readMessage()` first reads the small protocol header to learn the exact payload size, then allocates one `mem.Buffer` of that size and reads the payload directly in. This avoids the older pattern of reading into a Go-heap slice and cloning into a `mem.Buffer`. One buffer is shared across all recipients via `Retain`/`Release` reference counting.
 
@@ -98,7 +99,7 @@ Concrete `App` implementations live here, outside `internal/core`. Adding a new 
 - **Endpoints**:
   - `GET /` — HTTP upgrade to WebSocket
   - `GET /register` — issue a new identity (PubKey)
-  - `GET /metrics` — JSON metrics (RAM, CPU, goroutines, TPS, latency) — sourced from `app.Count()`, `app.Processed()/Delivered()/NoRecipient()`, and `app.LatencySnapshot()`
+  - `GET /metrics` — JSON runtime metrics (RAM, CPU, goroutines, uptime) at top level, plus app-defined metrics nested under `app_metrics` from `app.FetchMetrics()`
 
 ---
 
