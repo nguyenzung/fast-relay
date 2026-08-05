@@ -23,10 +23,16 @@ type AuthResult struct {
 	UserID string
 }
 
+// Authenticator verifies an inbound WebSocket upgrade request (the "/"
+// endpoint) and resolves the caller's identity before the connection is
+// accepted. A non-nil error rejects the upgrade with 400 Bad Request.
 type Authenticator interface {
 	Authenticate(r *http.Request) (*AuthResult, error)
 }
 
+// Registrar handles the "/register" endpoint: it provisions or resolves an
+// identity for a caller that does not yet have one. A non-nil error rejects
+// the request with 500 Internal Server Error.
 type Registrar interface {
 	Register(r *http.Request) (*AuthResult, error)
 }
@@ -63,7 +69,7 @@ func (reg *DefaultRegistrar) Register(r *http.Request) (*AuthResult, error) {
 
 // Server wraps HTTP server and relayer and exposes monitoring endpoints.
 type Server struct {
-	rel       *core.Relayer
+	app       core.App
 	h         *http.ServeMux
 	srv       *http.Server
 	outBuf    int
@@ -76,7 +82,10 @@ type Server struct {
 	registrar Registrar
 }
 
-func NewServer(addr string, outBuf int, auth Authenticator, reg Registrar) *Server {
+func NewServer(addr string, outBuf int, auth Authenticator, reg Registrar, app core.App) *Server {
+	if app == nil {
+		panic("server: app must not be nil")
+	}
 	if auth == nil {
 		auth = &DefaultAuthenticator{}
 	}
@@ -84,10 +93,9 @@ func NewServer(addr string, outBuf int, auth Authenticator, reg Registrar) *Serv
 		reg = &DefaultRegistrar{}
 	}
 
-	rel := core.NewRelayer()
 	h := http.NewServeMux()
 	s := &Server{
-		rel:         rel,
+		app:         app,
 		h:           h,
 		outBuf:      outBuf,
 		startTime:   time.Now(),
@@ -95,6 +103,8 @@ func NewServer(addr string, outBuf int, auth Authenticator, reg Registrar) *Serv
 		auth:        auth,
 		registrar:   reg,
 	}
+
+	app.StartRecording()
 
 	h.HandleFunc("/", s.wsHandler)
 	h.HandleFunc("/register", s.registerHandler)
@@ -158,8 +168,8 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	const readLimit = 512 * 1024
 	conn.SetReadLimit(readLimit)
 
-	c := network.NewWSConnector(conn, authResult.PubKey, s.rel, s.outBuf)
-	s.rel.Register(authResult.PubKey, c)
+	c := network.NewWSConnector(conn, authResult.PubKey, s.app, s.outBuf)
+	s.app.OnConnect(authResult.PubKey, c)
 
 	if err := c.ReadWriteLoop(r.Context()); err != nil {
 		// log.Printf("ReadLoop exited for pub=%s err=%v", pub, err)
@@ -206,38 +216,21 @@ func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m := map[string]interface{}{
-		"active_connections":         s.rel.Count(),
+		"active_connections":         s.app.Count(),
 		"goroutines":                 runtime.NumGoroutine(),
 		"alloc_bytes":                ms.Alloc,
 		"total_alloc_bytes":          ms.TotalAlloc,
 		"sys_bytes":                  ms.Sys,
 		"heap_objects":               ms.HeapObjects,
-		"processed_messages":         s.rel.Processed(),
-		"delivered_messages":         s.rel.Delivered(),
-		"no_recipient_messages":      s.rel.NoRecipient(),
 		"cpu_seconds":                totalCPU,
 		"cpu_percent":                cpuPercent,
 		"cpu_recent_percent":         cpuRecent,
 		"cpu_recent_percent_per_cpu": cpuRecentPerCPU,
 		"num_cpu":                    runtime.NumCPU(),
 		"uptime_seconds":             uptime,
-	}
-
-	// add latency snapshot (ms)
-	if cnt, meanMs, stdMs, p50, p95, p99 := s.rel.LatencySnapshot(); cnt > 0 {
-		m["latency_count"] = cnt
-		m["latency_mean_ms"] = meanMs
-		m["latency_std_ms"] = stdMs
-		m["latency_p50_ms"] = p50
-		m["latency_p95_ms"] = p95
-		m["latency_p99_ms"] = p99
-	} else {
-		m["latency_count"] = 0
-		m["latency_mean_ms"] = 0.0
-		m["latency_std_ms"] = 0.0
-		m["latency_p50_ms"] = 0.0
-		m["latency_p95_ms"] = 0.0
-		m["latency_p99_ms"] = 0.0
+		// App-defined metrics (shape is opaque to the server - see
+		// core.Metrics.FetchMetrics), nested as-is under its own key.
+		"app_metrics": s.app.FetchMetrics(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(m)
@@ -252,8 +245,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// stop sampler
 	close(s.stopSampler)
 	// close relayer to flush latency worker and other background tasks
-	if s.rel != nil {
-		s.rel.Close()
+	if s.app != nil {
+		s.app.StopRecording()
+		s.app.Close()
 	}
 	return s.srv.Shutdown(ctx)
 }

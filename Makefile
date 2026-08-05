@@ -9,7 +9,8 @@
 #   make stress         - build then run the loadtest binary (use ARGS to pass args)
 #   make run            - run the relayer from source (go run)
 #   make start          - build then run binary in foreground
-#   make test           - run go tests
+#   make test           - run go tests (-short, skips the heavy e2e churn test)
+#   make test-e2e       - run the e2e churn correctness test, output saved to test-result/e2e_churn_correctness.log
 #   make fmt            - run go fmt on the module
 #   make vet            - run go vet on the module
 #   make lint           - run golangci-lint if available
@@ -21,7 +22,7 @@ CLIENT_BIN=bin/client
 LOADTEST_BIN=bin/loadtest
 PKG=./...
 
-.PHONY: all build build-aarch64 client loadtest stress run start test fmt vet lint deps clean churntest churn metrics setup-jemalloc check-jemalloc
+.PHONY: all build build-aarch64 client loadtest stress run start test test-e2e fmt vet lint deps clean churntest churn metrics setup-jemalloc check-jemalloc
 all: build
 
 setup-jemalloc:
@@ -85,8 +86,14 @@ start: build
 	./$(BINARY)
 
 test:
-	@echo "Running tests..."
-	go test -v $(PKG)
+	@echo "Running tests (-short, skips the heavy e2e churn test)..."
+	go test -short -v $(PKG)
+
+test-e2e:
+	@echo "Running e2e churn correctness test (see e2e/churn_correctness_test.go for client count/duration)..."
+	@mkdir -p test-result
+	@echo "Full output: test-result/e2e_churn_correctness.log"
+	bash -o pipefail -c 'go test ./e2e/... -run TestChurnCorrectness -v -timeout 5m 2>&1 | tee test-result/e2e_churn_correctness.log'
 
 fmt:
 	@echo "Formatting..."

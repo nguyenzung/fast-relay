@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nguyenzung/relayer-server/internal/domains"
 	"github.com/nguyenzung/relayer-server/internal/server"
 )
 
@@ -17,8 +18,8 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	outBuf := flag.Int("outbuf", 256, "per-connection outbound buffer size")
 	flag.Parse()
-
-	srv := server.NewServer(*addr, *outBuf, nil, nil)
+	rel := domains.NewRelayer()
+	srv := server.NewServer(*addr, *outBuf, nil, nil, rel)
 
 	// Start server
 	go func() {

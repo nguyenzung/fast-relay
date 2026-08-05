@@ -1,4 +1,4 @@
-package core
+package domains
 
 import (
 	"log"
@@ -9,6 +9,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/nguyenzung/relayer-server/internal/core"
+	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
 // Relayer manages a global registry of connectors keyed by pubKey.
@@ -80,32 +83,70 @@ func (r *Relayer) Close() {
 	r.latencyWg.Wait()
 }
 
-// Register adds a connector into the global registry.
-func (r *Relayer) Register(pubKey [32]byte, c Connector) {
+// StartRecording implements core.Metrics.
+//
+// TODO: Relayer already starts its latency worker unconditionally in
+// NewRelayer; wire that startup here instead once callers are expected to
+// drive it explicitly via StartRecording.
+func (r *Relayer) StartRecording() {}
+
+// StopRecording implements core.Metrics.
+//
+// TODO: Relayer already stops its latency worker in Close; wire that
+// shutdown here instead once callers are expected to drive it explicitly
+// via StopRecording.
+func (r *Relayer) StopRecording() {}
+
+// RelayerMetrics is Relayer's snapshot shape, as returned by FetchMetrics.
+type RelayerMetrics struct {
+	Processed   uint64 `json:"processed_messages"`
+	Delivered   uint64 `json:"delivered_messages"`
+	NoRecipient uint64 `json:"no_recipient_messages"`
+
+	LatencyCount  uint64  `json:"latency_count"`
+	LatencyMeanMs float64 `json:"latency_mean_ms"`
+	LatencyStdMs  float64 `json:"latency_std_ms"`
+	LatencyP50Ms  float64 `json:"latency_p50_ms"`
+	LatencyP95Ms  float64 `json:"latency_p95_ms"`
+	LatencyP99Ms  float64 `json:"latency_p99_ms"`
+}
+
+// FetchMetrics implements core.Metrics.
+func (r *Relayer) FetchMetrics() any {
+	count, meanMs, stdMs, p50, p95, p99 := r.LatencySnapshot()
+	return RelayerMetrics{
+		Processed:   r.Processed(),
+		Delivered:   r.Delivered(),
+		NoRecipient: r.NoRecipient(),
+
+		LatencyCount:  count,
+		LatencyMeanMs: meanMs,
+		LatencyStdMs:  stdMs,
+		LatencyP50Ms:  p50,
+		LatencyP95Ms:  p95,
+		LatencyP99Ms:  p99,
+	}
+}
+
+// OnConnect adds a connector into the global registry.
+func (r *Relayer) OnConnect(pubKey [32]byte, c core.Connector) {
 	r.logger.Debug("Registering connector", "pub", pubKey)
 	r.connectors.Store(pubKey, c)
 }
 
-// Unregister removes a connector from the global registry.
-func (r *Relayer) Unregister(pubKey [32]byte) {
+// OnDisconnect removes a connector from the global registry.
+func (r *Relayer) OnDisconnect(pubKey [32]byte) {
 	r.logger.Debug("Unregistering connector", "pub", pubKey)
 	r.connectors.Delete(pubKey)
 }
 
-// Get returns the Connector registered under pubKey.
-func (r *Relayer) Get(pubKey [32]byte) (Connector, bool) {
+// GetConnectorByKey returns the Connector registered under pubKey.
+func (r *Relayer) GetConnectorByKey(pubKey [32]byte) (core.Connector, bool) {
 	v, ok := r.connectors.Load(pubKey)
 	if !ok {
 		return nil, false
 	}
-	return v.(Connector), true
-}
-
-// Range iterates over all connectors.
-func (r *Relayer) Range(fn func(pub [32]byte, c Connector) bool) {
-	r.connectors.Range(func(k, v interface{}) bool {
-		return fn(k.([32]byte), v.(Connector))
-	})
+	return v.(core.Connector), true
 }
 
 // Count returns the approximate number of registered connectors.
@@ -118,16 +159,53 @@ func (r *Relayer) Count() int {
 	return count
 }
 
+// HandleMessage implements core.App: it is the default targeted-multicast
+// routing decision, composed from shared protocol primitives
+// (core.ExtractTargets, core.DeliverTo - see internal/core/protocol.go) plus
+// Relayer's own policy: self is excluded via ExtractTargets; if no targets
+// remain, the message is dropped without incrementing processed. Otherwise
+// the recipient list is zeroed in-place (privacy, Relayer-specific) and the
+// message is pushed to each resolved connector via DeliverTo. A different
+// App can reuse the same two primitives with its own policy on top.
+func (r *Relayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
+	var targets [core.MaxTargetsPerMessage][32]byte
+	targetN := core.ExtractTargets(msg, from.ID(), &targets)
+
+	if targetN == 0 {
+		return
+	}
+
+	r.IncrementProcessed()
+	// ZeroToIDs zeros m[33:33+N*32] in-place. ToIDsLen (m[32]) and
+	// DataLen/Data offsets are untouched, so the protocol layout stays valid.
+	msg.ZeroToIDs()
+
+	matched := 0
+	for _, target := range targets[:targetN] {
+		if dest, ok := r.GetConnectorByKey(target); ok {
+			if core.DeliverTo(dest, msg, buf, recvTime) {
+				matched++
+			} else {
+				r.IncrementDeliveryFailure()
+			}
+		}
+	}
+
+	if matched == 0 {
+		r.IncrementDeliveryFailure()
+	}
+}
+
 // --- Atomic Counter Helpers for Hot Path ---
 
 // IncrementProcessed adds 1 to the processed message counter.
 func (r *Relayer) IncrementProcessed() { r.processed.Add(1) }
 
-// IncrementDelivered adds 1 to the delivered message counter.
-func (r *Relayer) IncrementDelivered() { r.delivered.Add(1) }
+// IncrementDeliverySuccess implements core.App.
+func (r *Relayer) IncrementDeliverySuccess() { r.delivered.Add(1) }
 
-// IncrementNoRecipient adds 1 to the no-recipient counter.
-func (r *Relayer) IncrementNoRecipient() { r.noRecip.Add(1) }
+// IncrementDeliveryFailure implements core.App.
+func (r *Relayer) IncrementDeliveryFailure() { r.noRecip.Add(1) }
 
 // --- Metrics Accessors ---
 

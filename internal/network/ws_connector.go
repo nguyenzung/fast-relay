@@ -26,10 +26,10 @@ type WSConnector struct {
 	outChan  chan core.OutMessage // Pass by value (slice header) to avoid heap escapes
 	isClosed bool
 	mu       sync.RWMutex
-	relayer  *core.Relayer
+	app      core.App
 }
 
-func NewWSConnector(conn *websocket.Conn, pubKey [32]byte, rel *core.Relayer, outBufSize int) *WSConnector {
+func NewWSConnector(conn *websocket.Conn, pubKey [32]byte, app core.App, outBufSize int) *WSConnector {
 	if outBufSize <= 0 {
 		outBufSize = 256
 	}
@@ -37,7 +37,7 @@ func NewWSConnector(conn *websocket.Conn, pubKey [32]byte, rel *core.Relayer, ou
 		conn:    conn,
 		pubKey:  pubKey,
 		outChan: make(chan core.OutMessage, outBufSize),
-		relayer: rel,
+		app:     app,
 	}
 }
 
@@ -155,9 +155,9 @@ func readMessage(r io.Reader, maxDataLen int) (*mem.Buffer, error) {
 // ReadWriteLoop is the primary pump. It handles binary protocol parsing and relaying.
 func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 	defer c.Close()
-	defer c.relayer.Unregister(c.pubKey)
+	defer c.app.OnDisconnect(c.pubKey)
 
-	go func(relayer *core.Relayer) {
+	go func(app core.App) {
 		for msg := range c.outChan {
 			wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
 			err := c.conn.Write(wctx, websocket.MessageBinary, msg.Msg)
@@ -166,7 +166,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 				msg.Buf.Release()
 			}
 			if err != nil {
-				relayer.IncrementNoRecipient()
+				app.IncrementDeliveryFailure()
 				// Close unblocks conn.Reader() in the main loop and closes outChan.
 				c.Close()
 				for msg := range c.outChan {
@@ -176,10 +176,10 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 				}
 				return
 			}
-			relayer.IncrementDelivered()
-			relayer.RecordLatency(time.Since(msg.RecvTime))
+			app.IncrementDeliverySuccess()
+			app.RecordLatency(time.Since(msg.RecvTime))
 		}
-	}(c.relayer)
+	}(c.app)
 
 	for {
 		mt, r, err := c.conn.Reader(ctx)
@@ -192,6 +192,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 		}
 
 		buf, err := readMessage(r, core.MaxMessageSize)
+
 		// recvTime captured after full message is in memory — equivalent to conn.Read() semantics.
 		recvTime := time.Now()
 		if errors.Is(err, errSkipMessage) {
@@ -211,59 +212,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 
 		// nTo already validated (1..core.MaxTargetsPerMessage) inside readMessage.
 		msg := core.Message(buf.Bytes())
-		nTo := int(msg.ToIDsLen())
-
-		var targets [core.MaxTargetsPerMessage][32]byte
-		targetN := 0
-		for i := 0; i < nTo; i++ {
-			id := msg.ToIDAt(i)
-			if id == c.pubKey {
-				continue
-			}
-			targets[targetN] = id
-			targetN++
-		}
-
-		if targetN == 0 {
-			buf.Release()
-			continue
-		}
-
-		c.relayer.IncrementProcessed()
-		// ZeroToIDs zeros m[33:33+N*32] in-place. ToIDsLen (m[32]) and
-		// DataLen/Data offsets are untouched, so the protocol layout stays valid.
-		msg.ZeroToIDs()
-		c.Relay(ctx, msg, buf, targets[:targetN], recvTime)
-	}
-}
-
-// Relay handles only targeted multicast.
-func (c *WSConnector) Relay(ctx context.Context, msg core.Message, buf *mem.Buffer, targets [][32]byte, recvTime time.Time) {
-	if len(targets) == 0 {
-		c.relayer.IncrementNoRecipient()
+		c.app.HandleMessage(c, msg, buf, recvTime)
 		buf.Release()
-		return
-	}
-
-	matched := 0
-	for _, target := range targets {
-		if dest, ok := c.relayer.Get(target); ok {
-			// Retain before each push so the write pump can Release independently.
-			buf.Retain()
-			outMsg := core.OutMessage{Msg: msg, RecvTime: recvTime, Buf: buf}
-			if dest.SafePush(outMsg) {
-				matched++
-			} else {
-				c.relayer.IncrementNoRecipient()
-				buf.Release() // push dropped, undo retain
-			}
-		}
-	}
-
-	// Release the initial ref from NewBuffer.
-	buf.Release()
-
-	if matched == 0 {
-		c.relayer.IncrementNoRecipient()
 	}
 }
