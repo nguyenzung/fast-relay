@@ -183,11 +183,13 @@ func fetchMetrics(url string) (map[string]float64, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("metrics status %d", resp.StatusCode)
 	}
-	var m map[string]float64
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+	var body struct {
+		AppMetrics map[string]float64 `json:"app_metrics"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, err
 	}
-	return m, nil
+	return body.AppMetrics, nil
 }
 
 func runConnector(ctx context.Context, addr string, pubs [][32]byte, pubsStr []string, idx int, m int, outBuf int, seed int64,

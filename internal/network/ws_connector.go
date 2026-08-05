@@ -166,7 +166,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 				msg.Buf.Release()
 			}
 			if err != nil {
-				app.IncrementNoRecipient()
+				app.IncrementDeliveryFailure()
 				// Close unblocks conn.Reader() in the main loop and closes outChan.
 				c.Close()
 				for msg := range c.outChan {
@@ -176,7 +176,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 				}
 				return
 			}
-			app.IncrementDelivered()
+			app.IncrementDeliverySuccess()
 			app.RecordLatency(time.Since(msg.RecvTime))
 		}
 	}(c.app)

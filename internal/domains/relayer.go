@@ -83,6 +83,51 @@ func (r *Relayer) Close() {
 	r.latencyWg.Wait()
 }
 
+// StartRecording implements core.Metrics.
+//
+// TODO: Relayer already starts its latency worker unconditionally in
+// NewRelayer; wire that startup here instead once callers are expected to
+// drive it explicitly via StartRecording.
+func (r *Relayer) StartRecording() {}
+
+// StopRecording implements core.Metrics.
+//
+// TODO: Relayer already stops its latency worker in Close; wire that
+// shutdown here instead once callers are expected to drive it explicitly
+// via StopRecording.
+func (r *Relayer) StopRecording() {}
+
+// RelayerMetrics is Relayer's snapshot shape, as returned by FetchMetrics.
+type RelayerMetrics struct {
+	Processed   uint64 `json:"processed_messages"`
+	Delivered   uint64 `json:"delivered_messages"`
+	NoRecipient uint64 `json:"no_recipient_messages"`
+
+	LatencyCount  uint64  `json:"latency_count"`
+	LatencyMeanMs float64 `json:"latency_mean_ms"`
+	LatencyStdMs  float64 `json:"latency_std_ms"`
+	LatencyP50Ms  float64 `json:"latency_p50_ms"`
+	LatencyP95Ms  float64 `json:"latency_p95_ms"`
+	LatencyP99Ms  float64 `json:"latency_p99_ms"`
+}
+
+// FetchMetrics implements core.Metrics.
+func (r *Relayer) FetchMetrics() any {
+	count, meanMs, stdMs, p50, p95, p99 := r.LatencySnapshot()
+	return RelayerMetrics{
+		Processed:   r.Processed(),
+		Delivered:   r.Delivered(),
+		NoRecipient: r.NoRecipient(),
+
+		LatencyCount:  count,
+		LatencyMeanMs: meanMs,
+		LatencyStdMs:  stdMs,
+		LatencyP50Ms:  p50,
+		LatencyP95Ms:  p95,
+		LatencyP99Ms:  p99,
+	}
+}
+
 // OnConnect adds a connector into the global registry.
 func (r *Relayer) OnConnect(pubKey [32]byte, c core.Connector) {
 	r.logger.Debug("Registering connector", "pub", pubKey)
@@ -102,13 +147,6 @@ func (r *Relayer) GetConnectorByKey(pubKey [32]byte) (core.Connector, bool) {
 		return nil, false
 	}
 	return v.(core.Connector), true
-}
-
-// Range iterates over all connectors.
-func (r *Relayer) Range(fn func(pub [32]byte, c core.Connector) bool) {
-	r.connectors.Range(func(k, v interface{}) bool {
-		return fn(k.([32]byte), v.(core.Connector))
-	})
 }
 
 // Count returns the approximate number of registered connectors.
@@ -148,13 +186,13 @@ func (r *Relayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.
 			if core.DeliverTo(dest, msg, buf, recvTime) {
 				matched++
 			} else {
-				r.IncrementNoRecipient()
+				r.IncrementDeliveryFailure()
 			}
 		}
 	}
 
 	if matched == 0 {
-		r.IncrementNoRecipient()
+		r.IncrementDeliveryFailure()
 	}
 }
 
@@ -163,11 +201,11 @@ func (r *Relayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.
 // IncrementProcessed adds 1 to the processed message counter.
 func (r *Relayer) IncrementProcessed() { r.processed.Add(1) }
 
-// IncrementDelivered adds 1 to the delivered message counter.
-func (r *Relayer) IncrementDelivered() { r.delivered.Add(1) }
+// IncrementDeliverySuccess implements core.App.
+func (r *Relayer) IncrementDeliverySuccess() { r.delivered.Add(1) }
 
-// IncrementNoRecipient adds 1 to the no-recipient counter.
-func (r *Relayer) IncrementNoRecipient() { r.noRecip.Add(1) }
+// IncrementDeliveryFailure implements core.App.
+func (r *Relayer) IncrementDeliveryFailure() { r.noRecip.Add(1) }
 
 // --- Metrics Accessors ---
 

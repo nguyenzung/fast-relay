@@ -459,9 +459,18 @@ func fetchMetrics(addr string) (map[string]float64, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("metrics status %d", resp.StatusCode)
 	}
-	var m map[string]float64
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
+	}
+	// "app_metrics" (and any other App-defined field) is opaque and not
+	// necessarily numeric - keep only the flat numeric fields this test
+	// actually asserts on (e.g. "active_connections").
+	m := make(map[string]float64, len(raw))
+	for k, v := range raw {
+		if f, ok := v.(float64); ok {
+			m[k] = f
+		}
 	}
 	return m, nil
 }
