@@ -366,3 +366,92 @@ The connection registry uses `sync.Map`, which fits the read-heavy access patter
 Each connection owns a read pump and a write pump. Idle write pumps block on channel receive and consume no CPU. Go's scheduler multiplexes these goroutines onto a much smaller number of OS threads, so tens of thousands of mostly idle connections remain cheap.
 
 This explains why the benchmark holds ~20,000–25,000 concurrent connections while consuming only ~5 of 16 available CPU cores.
+
+---
+
+## 7. Distributed Deployment Extensibility
+
+Everything above (§1–§6) describes a single process. This section is about what happens when one process is not enough — what the architecture does and does not give you toward running a cluster of relay nodes.
+
+### 7.1. What the architecture provides: an extension seam, not a runtime
+
+`internal/network`'s entire job is:
+
+```text
+WebSocket frame → parse common binary envelope → app.HandleMessage(from, msg, buf, recvTime)
+```
+
+It has no opinion on what happens next. `core.App.HandleMessage` owns the complete routing decision (§2.2), so a domain implementation is free to do more than look up a local `sync.Map`. Nothing in `core`, `network`, or `server` assumes the recipient is reachable through a local `Connector` — that assumption lives entirely inside `domains.Relayer.HandleMessage`, which is one possible policy, not the only one.
+
+A cluster-aware `App` can be dropped in without touching any other layer:
+
+```go
+func (r *DistributedRelayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
+    var targets [core.MaxTargetsPerMessage][32]byte
+    n := core.ExtractTargets(msg, from.ID(), &targets)
+    msg.ZeroToIDs()
+
+    for _, target := range targets[:n] {
+        if dest, ok := r.localRegistry.GetConnectorByKey(target); ok {
+            core.DeliverTo(dest, msg, buf, recvTime) // local hop, existing primitive
+            continue
+        }
+        if node, ok := r.directory.LookupOwner(target); ok {
+            r.interNode.Forward(node, target, msg, buf, recvTime) // this node's own logic
+            continue
+        }
+        r.IncrementDeliveryFailure()
+    }
+}
+```
+
+`core.ExtractTargets` and `core.DeliverTo` (§2.2) are reused as-is for the local-hop case; the remote-hop case is entirely new code owned by the domain, wired up in a new `cmd/<name>/main.go`. `internal/core`, `internal/network`, and `internal/server` do not change, and the wire envelope (§6.1) does not change.
+
+Two properties make this practically workable, not just theoretically possible:
+
+- **`Connector` is already an interface** (§2.2). A "remote" connector that forwards bytes to another node over gRPC/NATS/a custom TCP protocol instead of writing to a local WebSocket satisfies `core.Connector` the same way `WSConnector` does — nothing downstream can tell the difference.
+- **The `buf` retain/release contract is transport-agnostic** (§2.2, §6.4). `DeliverTo` retains before a local push and releases if it's dropped; an inter-node sender must follow the same discipline — retain until the payload bytes are actually copied onto the wire (or queued past the point where they're needed), then release exactly once. This is the same rule `WSConnector`'s write pump already follows for local delivery — a distributed connector does not get a different contract, only a different transport underneath it.
+
+### 7.2. What the architecture does not provide
+
+None of the following exists in this codebase, and nothing here is designed to provide it:
+
+- Cluster membership or discovery
+- A routing/ownership directory (the `directory.LookupOwner` call above is a stub — no such type exists)
+- Inter-node transport
+- Consensus, replication, or sharding
+- Failure detection or automatic failover
+- Distributed tracing
+
+This is deliberate, not an oversight: different `App`s need fundamentally different distribution models (a relay routes by `PubKey → owning node`; a game server routes by `Room → authoritative node`; an MPC service routes by `SessionID → participant set`). Baking one specific model — consistent hashing, a Redis-backed registry, a particular replication scheme — into `core` would force every `App` through a shape that doesn't fit most of them. The design instead keeps `core` to the one thing every `App` needs regardless of topology (frame in, routing decision out) and leaves the distribution model itself as application policy: **transport owns delivery mechanics; the App owns routing and distribution semantics.**
+
+### 7.3. What a distributed `App` still has to solve on its own
+
+Having the extension seam does not make a correct distributed system automatic. Any concrete cluster-aware `App` built on top of §7.1 still owns the usual hard problems of a distributed system, none of which `core.App` abstracts away:
+
+- A node dying mid-route, after ownership lookup but before delivery
+- Stale ownership data (the directory says node B, but the client reconnected to node C)
+- The same client momentarily registered on two nodes during a reconnect/migration race
+- Duplicate delivery from retries, or out-of-order delivery across nodes
+- Inter-node queue backpressure and what to do when it's full
+- Split-brain between nodes that disagree on ownership
+- Version skew during a rolling deployment
+- A recipient's ownership migrating while a message for them is already in flight
+
+These are not gaps in the layering — they are exactly the problems a distributed implementation is responsible for solving, and no amount of interface design at the `core` layer removes them.
+
+### 7.4. A concrete single-node assumption worth knowing
+
+One specific place the current shipped `App` (`domains.Relayer`) is single-node by construction, not by contract: `Count()` and `FetchMetrics()` (§2.2, §2.3) only ever see connections registered via `OnConnect` on the local process. In a multi-node deployment, `/metrics`' `active_connections` and `app_metrics` (§2.5) each report that node's local view only — there is no cluster-wide aggregation anywhere in this codebase. A distributed deployment that wants fleet-wide numbers has to aggregate `/metrics` across nodes itself (e.g. at the scrape/dashboard layer); nothing here does it for you.
+
+### 7.5. Summary
+
+| Aspect | Status |
+|---|---|
+| Extension seam for distributed routing (`core.App.HandleMessage`) | Present, and reusable via `core.ExtractTargets`/`core.DeliverTo` for the local-hop case |
+| `Connector` as a transport-agnostic delivery target | Present — a remote connector is a normal `core.Connector` |
+| Cluster membership, directory, inter-node transport, consensus, replication | Not present — left to the concrete `App` |
+| Cluster-wide metrics | Not present — `/metrics` is per-node |
+| Correctness under node failure, stale ownership, duplication, ordering | Not addressed by this layer — owned entirely by whatever distributed `App` is built |
+
+In short: this is a **single-node relay with a routing seam that does not have to be reworked to grow into a distributed one** — not a distributed system today, and not a claim this document makes elsewhere.

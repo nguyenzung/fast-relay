@@ -87,21 +87,34 @@ make churn ARGS="-n 1000 -m 10 -addr localhost:8080"
 ```json
 {
   "active_connections": 20886,
-  "processed_messages": 14398018519,
-  "delivered_messages": 12054818090,
-  "latency_p50_ms": 0.021,
-  "latency_p95_ms": 0.042,
-  "latency_p99_ms": 0.074,
   "cpu_percent": 493.88,
   "alloc_bytes": 1008676352,
-  "process_rss_mb": 1976.88,
-  "rss_per_conn_kb": 96.92
+  "sys_bytes": 2246647808,
+  "uptime_seconds": 137542.1,
+  "app_metrics": {
+    "processed_messages": 14398018519,
+    "delivered_messages": 12054818090,
+    "no_recipient_messages": 12345,
+    "latency_p50_ms": 0.021,
+    "latency_p95_ms": 0.042,
+    "latency_p99_ms": 0.074
+  }
 }
 ```
+
+`active_connections` and `app_metrics` reflect this process only — in a multi-node deployment, each node exposes its own `/metrics`; there is no built-in cluster-wide aggregation (see [Distributed Deployment](#distributed-deployment) below).
 
 ## Architecture
 
 See [`Architecture.md`](Architecture.md) for component details, data flow, and the performance model explaining why the server achieves these numbers.
+
+## Distributed Deployment
+
+This server is single-node: there is no built-in cluster membership, cross-node routing, or replication. What it does provide is a routing seam that a distributed implementation can be built on without changing the transport.
+
+`internal/network` only parses the wire frame and hands it to `app.HandleMessage(...)` — it has no opinion on where a recipient lives. The shipped `domains.Relayer` resolves recipients through a local in-memory registry, but that's a policy choice made inside `HandleMessage`, not something `internal/core`, `internal/network`, or `internal/server` assume. A cluster-aware `App` can look up a local connector first and forward to another node for everything else, reusing the existing `core.ExtractTargets`/`core.DeliverTo` primitives for the local case, without touching any other layer.
+
+That seam does not include cluster membership, an ownership directory, inter-node transport, consensus/replication, or cluster-wide metrics — those are left to whatever distributed `App` you build, along with the usual distributed-systems problems (stale ownership, duplicate/out-of-order delivery, node failure mid-route, backpressure across nodes). See [Architecture.md §7](Architecture.md#7-distributed-deployment-extensibility) for the full breakdown.
 
 ## License
 
