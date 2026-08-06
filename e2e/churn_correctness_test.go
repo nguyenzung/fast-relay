@@ -30,7 +30,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/nguyenzung/relayer-server/internal/core"
-	"github.com/nguyenzung/relayer-server/internal/domains"
+	"github.com/nguyenzung/relayer-server/internal/domains/relayer"
 	"github.com/nguyenzung/relayer-server/internal/server"
 )
 
@@ -489,7 +489,7 @@ func startTestServer(t *testing.T, outBuf int) (addr string, serverDied <-chan e
 	addr = ln.Addr().String()
 	_ = ln.Close()
 
-	app := domains.NewRelayer()
+	app := relayer.NewRelayer()
 	srv := server.NewServer(addr, outBuf, nil, nil, app)
 
 	died := make(chan error, 1)
