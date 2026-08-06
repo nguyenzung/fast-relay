@@ -10,6 +10,7 @@
 #   make run            - run the relayer from source (go run)
 #   make start          - build then run binary in foreground
 #   make test           - run go tests (-short, skips the heavy e2e churn test)
+#   make test-unit      - run only the unit tests (internal/..., race-enabled; excludes e2e/ by package path)
 #   make test-e2e       - run the e2e churn correctness test, output saved to test-result/e2e_churn_correctness.log
 #   make fmt            - run go fmt on the module
 #   make vet            - run go vet on the module
@@ -21,8 +22,11 @@ BINARY=bin/relayer
 CLIENT_BIN=bin/client
 LOADTEST_BIN=bin/loadtest
 PKG=./...
+# Package path exclusion (not just -short) so a future e2e test that forgets
+# testing.Short() can't sneak a multi-minute run into test-unit.
+UNIT_PKG=$(shell go list ./... | grep -v '/e2e$$')
 
-.PHONY: all build build-aarch64 client loadtest stress run start test test-e2e fmt vet lint deps clean churntest churn metrics setup-jemalloc check-jemalloc
+.PHONY: all build build-aarch64 client loadtest stress run start test test-unit test-e2e fmt vet lint deps clean churntest churn metrics setup-jemalloc check-jemalloc
 all: build
 
 setup-jemalloc:
@@ -88,6 +92,10 @@ start: build
 test:
 	@echo "Running tests (-short, skips the heavy e2e churn test)..."
 	go test -short -v $(PKG)
+
+test-unit:
+	@echo "Running unit tests (-race, excludes e2e/)..."
+	go test -race -v $(UNIT_PKG)
 
 test-e2e:
 	@echo "Running e2e churn correctness test (see e2e/churn_correctness_test.go for client count/duration)..."

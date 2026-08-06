@@ -69,8 +69,8 @@ func (reg *DefaultRegistrar) Register(r *http.Request) (*AuthResult, error) {
 
 // Server wraps HTTP server and relayer and exposes monitoring endpoints.
 type Server struct {
-	app       core.App
-	h         *http.ServeMux
+	app core.App
+	// h         *http.ServeMux
 	srv       *http.Server
 	outBuf    int
 	startTime time.Time
@@ -96,7 +96,6 @@ func NewServer(addr string, outBuf int, auth Authenticator, reg Registrar, app c
 	h := http.NewServeMux()
 	s := &Server{
 		app:         app,
-		h:           h,
 		outBuf:      outBuf,
 		startTime:   time.Now(),
 		stopSampler: make(chan struct{}),
@@ -232,8 +231,13 @@ func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		// core.Metrics.FetchMetrics), nested as-is under its own key.
 		"app_metrics": s.app.FetchMetrics(),
 	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(m)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) Start() error {
