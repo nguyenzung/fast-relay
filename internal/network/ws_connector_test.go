@@ -15,7 +15,7 @@ import (
 	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
-// fakeConn implements wsConn without touching a real socket. It lets
+// fakeConn implements wsConn without touching a real socket. It lets tests drive ReadWriteLoop deterministically.
 type fakeConn struct {
 	mu sync.Mutex
 
