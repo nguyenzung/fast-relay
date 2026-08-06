@@ -19,9 +19,20 @@ var (
 	errSkipMessage     = errors.New("skip") // internal sentinel — not a connection error
 )
 
+// wsConn is the subset of *websocket.Conn that WSConnector needs. Extracted
+// as an interface (rather than depending on *websocket.Conn directly) so
+// tests can substitute a fake implementation instead of driving ReadWriteLoop
+// through a real network socket. *websocket.Conn satisfies this today with
+// no changes on its end.
+type wsConn interface {
+	Reader(ctx context.Context) (websocket.MessageType, io.Reader, error)
+	Write(ctx context.Context, typ websocket.MessageType, p []byte) error
+	Close(code websocket.StatusCode, reason string) error
+}
+
 // WSConnector implements core.Connector using coder/websocket.
 type WSConnector struct {
-	conn     *websocket.Conn
+	conn     wsConn
 	pubKey   [32]byte
 	outChan  chan core.OutMessage // Pass by value (slice header) to avoid heap escapes
 	isClosed bool
@@ -29,7 +40,7 @@ type WSConnector struct {
 	app      core.App
 }
 
-func NewWSConnector(conn *websocket.Conn, pubKey [32]byte, app core.App, outBufSize int) *WSConnector {
+func NewWSConnector(conn wsConn, pubKey [32]byte, app core.App, outBufSize int) *WSConnector {
 	if outBufSize <= 0 {
 		outBufSize = 256
 	}
