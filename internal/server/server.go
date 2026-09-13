@@ -163,8 +163,11 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ws accept error: %v", err)
 		return
 	}
-	// coder/websocket Conn supports SetReadLimit directly
-	const readLimit = 512 * 1024
+	// coder/websocket Conn supports SetReadLimit directly. readLimit bounds
+	// the whole WebSocket frame (header + payload), so it must cover the
+	// protocol header (FromID + ToIDsLen + ToIDs + DataLen) on top of
+	// core.MaxMessageSize, which only bounds the Data field.
+	const readLimit = 33 + core.MaxTargetsPerMessage*32 + 4 + core.MaxMessageSize
 	conn.SetReadLimit(readLimit)
 
 	c := network.NewWSConnector(conn, authResult.PubKey, s.app, s.outBuf)

@@ -15,8 +15,17 @@ import (
 // ExtractTargets reads the recipient list from msg (msg.ToIDs), excluding
 // self, into dst. dst must have capacity >= MaxTargetsPerMessage. Returns
 // the number of entries written into dst.
+//
+// msg.ToIDsLen is untrusted wire input (a uint8, so up to 255) and is
+// clamped to MaxTargetsPerMessage here so this function is safe to call
+// directly on any Message, regardless of upstream validation - callers that
+// already reject nTo > MaxTargetsPerMessage (e.g. internal/network) are
+// unaffected, since clamping is a no-op once nTo is already in range.
 func ExtractTargets(msg Message, self [32]byte, dst *[MaxTargetsPerMessage][32]byte) int {
 	nTo := int(msg.ToIDsLen())
+	if nTo > MaxTargetsPerMessage {
+		nTo = MaxTargetsPerMessage
+	}
 	n := 0
 	for i := 0; i < nTo; i++ {
 		id := msg.ToIDAt(i)
