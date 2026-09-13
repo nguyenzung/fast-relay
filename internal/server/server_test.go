@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ type fakeApp struct {
 	mu            sync.Mutex
 	connect       [][32]byte
 	disconnect    [][32]byte
+	handled       []int // len(msg) for each HandleMessage call
 	count         int
 	metrics       any
 	closed        bool
@@ -45,6 +47,9 @@ func (a *fakeApp) OnDisconnect(pubKey [32]byte) {
 }
 
 func (a *fakeApp) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.handled = append(a.handled, len(msg))
 }
 
 func (a *fakeApp) Count() int {
@@ -93,6 +98,18 @@ func (a *fakeApp) wasClosed() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.closed
+}
+
+func (a *fakeApp) handledCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.handled)
+}
+
+func (a *fakeApp) handledLen(i int) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.handled[i]
 }
 
 var _ core.App = (*fakeApp)(nil)
@@ -276,6 +293,67 @@ func TestShutdown_WithOpenWebSocket(t *testing.T) {
 	}
 
 	<-serveDone // Serve must return (http.ErrServerClosed) once Shutdown closed the listener
+}
+
+// TestWSHandler_MaxSizeMessageAccepted is a regression test for issue #5:
+// readLimit used to equal core.MaxMessageSize exactly, but SetReadLimit
+// bounds the whole WebSocket frame (header + payload), not just the Data
+// field. A message whose Data is exactly core.MaxMessageSize — the maximum
+// size the protocol documents as valid — used to overflow the frame limit,
+// closing the sender's connection instead of delivering the message.
+func TestWSHandler_MaxSizeMessageAccepted(t *testing.T) {
+	var pubKey [32]byte
+	pubKey[0] = 0x11
+	app := &fakeApp{}
+	auth := &mockAuth{result: &AuthResult{PubKey: pubKey, UserID: "u1"}}
+	s := NewServer("127.0.0.1:0", 8, auth, nil, app)
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = s.srv.Serve(ln) }()
+
+	wsURL := "ws://" + ln.Addr().String() + "/"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusInternalError, "test cleanup")
+
+	waitForCondition(t, 2*time.Second, func() bool { return len(app.connectedIDs()) == 1 })
+
+	var to [32]byte
+	to[0] = 0x22
+	frame := make([]byte, 0, 33+32+4+core.MaxMessageSize)
+	frame = append(frame, pubKey[:]...)
+	frame = append(frame, 1) // ToIDsLen
+	frame = append(frame, to[:]...)
+	var dataLen [4]byte
+	binary.BigEndian.PutUint32(dataLen[:], uint32(core.MaxMessageSize))
+	frame = append(frame, dataLen[:]...)
+	frame = append(frame, make([]byte, core.MaxMessageSize)...)
+
+	if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("write of max-size frame failed: %v", err)
+	}
+
+	waitForCondition(t, 5*time.Second, func() bool { return app.handledCount() == 1 })
+	if got := app.handledLen(0); got != len(frame) {
+		t.Fatalf("HandleMessage saw %d bytes, want %d", got, len(frame))
+	}
+
+	// The connection must still be usable afterwards — before the fix, the
+	// server closed the sender once the frame exceeded readLimit, so a
+	// follow-up write would fail.
+	small := append(append(append(append([]byte{}, pubKey[:]...), 1), to[:]...), 0, 0, 0, 0)
+	if err := conn.Write(ctx, websocket.MessageBinary, small); err != nil {
+		t.Fatalf("write after max-size frame failed (sender was likely closed): %v", err)
+	}
+	waitForCondition(t, 2*time.Second, func() bool { return app.handledCount() == 2 })
 }
 
 func TestRegisterHandler_Success(t *testing.T) {
