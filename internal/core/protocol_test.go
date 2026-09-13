@@ -99,6 +99,35 @@ func TestExtractTargets(t *testing.T) {
 			}
 		}
 	})
+
+	// Regression test for issue #4: ToIDsLen is untrusted wire input (uint8,
+	// up to 255) while dst has a fixed capacity of MaxTargetsPerMessage.
+	// internal/network already rejects nTo > MaxTargetsPerMessage before
+	// calling ExtractTargets, but this function is exported and documented
+	// (README, "Distributed Deployment") for reuse by other Apps — it must
+	// not panic even when called directly on an unvalidated Message.
+	t.Run("clamps nTo above MaxTargetsPerMessage instead of overflowing dst", func(t *testing.T) {
+		targets := make([][32]byte, core.MaxTargetsPerMessage+5)
+		for i := range targets {
+			targets[i] = idFor(byte(i + 1))
+		}
+		m := buildMessage(t, idFor(9), targets, nil)
+		if got := m.ToIDsLen(); int(got) != len(targets) {
+			t.Fatalf("test fixture ToIDsLen = %d, want %d", got, len(targets))
+		}
+
+		var dst [core.MaxTargetsPerMessage][32]byte
+		n := core.ExtractTargets(m, self, &dst) // must not panic
+
+		if n != core.MaxTargetsPerMessage {
+			t.Fatalf("n = %d, want %d (clamped)", n, core.MaxTargetsPerMessage)
+		}
+		for i := 0; i < n; i++ {
+			if dst[i] != targets[i] {
+				t.Fatalf("dst[%d] = %x, want %x", i, dst[i], targets[i])
+			}
+		}
+	})
 }
 
 func TestDeliverTo(t *testing.T) {

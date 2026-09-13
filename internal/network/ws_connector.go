@@ -89,7 +89,8 @@ func (c *WSConnector) Close() {
 // Returns:
 //   - (buf, nil)           — valid message, caller owns buf
 //   - (nil, errSkipMessage) — nTo==0, reader drained, connection continues
-//   - (nil, ErrInvalidMessage) — protocol violation (nTo>max, trailing bytes); caller closes connection
+//   - (nil, ErrInvalidMessage) — protocol violation (nTo>max, a repeated
+//     recipient in ToIDs, or trailing bytes); caller closes connection
 //   - (nil, ErrMessageTooLarge) — DataLen exceeds limit; caller closes connection
 //   - (nil, other error)   — I/O error; caller closes connection
 //
@@ -120,6 +121,13 @@ func readMessage(r io.Reader, maxDataLen int) (*mem.Buffer, error) {
 	tailN := toIDsLen + 4
 	if _, err := io.ReadFull(r, tail[:tailN]); err != nil {
 		return nil, err
+	}
+
+	if hasDuplicateTarget(tail[:toIDsLen], nTo) {
+		// A repeated recipient amplifies delivery (core.ExtractTargets has no
+		// dedup of its own) and has no legitimate use — reject as a protocol
+		// violation. No drain — caller will close.
+		return nil, ErrInvalidMessage
 	}
 
 	dataLen := int(binary.BigEndian.Uint32(tail[toIDsLen : toIDsLen+4]))
@@ -161,6 +169,26 @@ func readMessage(r io.Reader, maxDataLen int) (*mem.Buffer, error) {
 	}
 
 	return buf, nil
+}
+
+// hasDuplicateTarget reports whether toIDs — n consecutive 32-byte recipient
+// IDs — contains the same ID more than once. n is at most
+// core.MaxTargetsPerMessage (already enforced by the caller), so the O(n^2)
+// comparison is at most 45 comparisons of 32 bytes each.
+func hasDuplicateTarget(toIDs []byte, n int) bool {
+	id := func(i int) [32]byte {
+		var out [32]byte
+		copy(out[:], toIDs[i*32:i*32+32])
+		return out
+	}
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			if id(i) == id(j) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ReadWriteLoop is the primary pump. It handles binary protocol parsing and relaying.

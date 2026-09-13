@@ -118,6 +118,52 @@ func buildFrame(t *testing.T, data []byte) []byte {
 	return buf.Bytes()
 }
 
+// TestReadMessage_DuplicateTargetRejected is a regression test: a repeated
+// recipient in ToIDs amplifies delivery (core.ExtractTargets has no dedup of
+// its own) with no legitimate use, so readMessage must reject it as a
+// protocol violation instead of accepting it.
+func TestReadMessage_DuplicateTargetRejected(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(make([]byte, 32)) // FromID
+	buf.WriteByte(2)            // ToIDsLen
+	dup := make([]byte, 32)
+	dup[0] = 0x42
+	buf.Write(dup) // recipient 1
+	buf.Write(dup) // recipient 2 — same id, must be rejected
+	var dataLen [4]byte
+	buf.Write(dataLen[:])
+
+	_, err := readMessage(&buf, core.MaxMessageSize)
+	if !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("readMessage() err = %v, want ErrInvalidMessage", err)
+	}
+}
+
+// TestReadMessage_DistinctTargetsAccepted is the control for
+// TestReadMessage_DuplicateTargetRejected: the same shape with two distinct
+// recipient ids (exercising the pairwise comparison with n > 1) must still
+// be accepted.
+func TestReadMessage_DistinctTargetsAccepted(t *testing.T) {
+	payload := []byte("hi")
+	var raw bytes.Buffer
+	raw.Write(make([]byte, 32)) // FromID
+	raw.WriteByte(2)            // ToIDsLen
+	id1, id2 := make([]byte, 32), make([]byte, 32)
+	id1[0], id2[0] = 0x01, 0x02
+	raw.Write(id1)
+	raw.Write(id2)
+	var dataLen [4]byte
+	binary.BigEndian.PutUint32(dataLen[:], uint32(len(payload)))
+	raw.Write(dataLen[:])
+	raw.Write(payload)
+
+	buf, err := readMessage(&raw, core.MaxMessageSize)
+	if err != nil {
+		t.Fatalf("readMessage() err = %v, want nil", err)
+	}
+	defer buf.Release()
+}
+
 // TestReadWriteLoop_HappyPath proves the wsConn seam (UT.md item 1): ReadWriteLoop
 // is driven end-to-end through a fake connection, with no real network socket.
 func TestReadWriteLoop_HappyPath(t *testing.T) {
