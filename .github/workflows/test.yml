@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+
+# Cancel a stale run for the same PR when new commits are pushed, so we
+# don't burn CI minutes on outdated diffs.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install jemalloc (required for the Linux/cgo build)
+        run: make setup-jemalloc
+
+      - name: go vet
+        run: make vet
+
+      # -race, excludes e2e/ by package path — the fast, deterministic gate
+      # for every PR. The heavy e2e churn test (internal/e2e, ~2 min, tuned
+      # against a dedicated multi-core machine) is intentionally left out of
+      # this gate to avoid flakiness on shared CI runners; run it locally
+      # with `make test-e2e` before merging changes that touch the hot path.
+      - name: Unit tests (race-enabled)
+        run: make test-unit
