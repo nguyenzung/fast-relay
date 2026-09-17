@@ -17,7 +17,6 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/nguyenzung/relayer-server/internal/core"
-	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
 // fakeApp implements core.App with just enough behavior for the handler
@@ -46,10 +45,10 @@ func (a *fakeApp) OnDisconnect(pubKey [32]byte) {
 	a.disconnect = append(a.disconnect, pubKey)
 }
 
-func (a *fakeApp) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
+func (a *fakeApp) HandleMessage(from core.Connector, m core.OutMessage) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.handled = append(a.handled, len(msg))
+	a.handled = append(a.handled, len(m.Msg()))
 }
 
 func (a *fakeApp) Count() int {
@@ -326,10 +325,12 @@ func TestWSHandler_MaxSizeMessageAccepted(t *testing.T) {
 
 	waitForCondition(t, 2*time.Second, func() bool { return len(app.connectedIDs()) == 1 })
 
+	// The wire carries no FromID (see network.readMessage) — the server
+	// stamps the authenticated identity into the in-memory Message itself,
+	// so the frame on the wire is 32 bytes shorter than the delivered one.
 	var to [32]byte
 	to[0] = 0x22
-	frame := make([]byte, 0, 33+32+4+core.MaxMessageSize)
-	frame = append(frame, pubKey[:]...)
+	frame := make([]byte, 0, 1+32+4+core.MaxMessageSize)
 	frame = append(frame, 1) // ToIDsLen
 	frame = append(frame, to[:]...)
 	var dataLen [4]byte
@@ -342,14 +343,16 @@ func TestWSHandler_MaxSizeMessageAccepted(t *testing.T) {
 	}
 
 	waitForCondition(t, 5*time.Second, func() bool { return app.handledCount() == 1 })
-	if got := app.handledLen(0); got != len(frame) {
-		t.Fatalf("HandleMessage saw %d bytes, want %d", got, len(frame))
+	// The in-memory core.Message reserves 32 bytes for FromID on top of what
+	// was sent on the wire.
+	if got, want := app.handledLen(0), len(frame)+32; got != want {
+		t.Fatalf("HandleMessage saw %d bytes, want %d", got, want)
 	}
 
 	// The connection must still be usable afterwards — before the fix, the
 	// server closed the sender once the frame exceeded readLimit, so a
 	// follow-up write would fail.
-	small := append(append(append(append([]byte{}, pubKey[:]...), 1), to[:]...), 0, 0, 0, 0)
+	small := append(append([]byte{1}, to[:]...), 0, 0, 0, 0)
 	if err := conn.Write(ctx, websocket.MessageBinary, small); err != nil {
 		t.Fatalf("write after max-size frame failed (sender was likely closed): %v", err)
 	}

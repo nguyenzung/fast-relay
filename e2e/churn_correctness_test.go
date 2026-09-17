@@ -255,7 +255,6 @@ func runChurnCorrectnessClient(
 ) {
 	r := rand.New(rand.NewSource(int64(idx) + 1))
 	n := len(pubs)
-	pub := pubs[idx]
 	pubHex := pubsHex[idx]
 	var seq uint64
 
@@ -341,8 +340,9 @@ func runChurnCorrectnessClient(
 				// can never observe the message before its record exists.
 				sentMessages.Store(sentKey{senderIdx: uint32(idx), seq: mySeq}, &sentRecord{targetIdx: uint32(targetIdx)})
 
+				// Wire carries no FromID; the server stamps our authenticated
+				// identity onto the message before relaying it to target.
 				var buf []byte
-				buf = append(buf, pub[:]...)
 				buf = append(buf, 1)
 				buf = append(buf, target[:]...)
 				var lenb [4]byte

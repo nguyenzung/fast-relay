@@ -161,7 +161,6 @@ func runChurnClient(ctx context.Context, addr string, pubs [][32]byte, pubsStr [
 	if idx < 0 || idx >= n {
 		return
 	}
-	pub := pubs[idx]
 	pubHex := pubsStr[idx]
 	for {
 		select {
@@ -256,9 +255,10 @@ func runChurnClient(ctx context.Context, addr string, pubs [][32]byte, pubsStr [
 				}
 				target := pubs[targetIdx]
 
-				// build targeted message: FromID(32), ToIDsLen=1, ToID(32), DataLen(4), Data
+				// build targeted message: ToIDsLen=1, ToID(32), DataLen(4), Data
+				// (wire carries no FromID; the server stamps our
+				// authenticated identity before relaying)
 				var buf []byte
-				buf = append(buf, pub[:]...)
 				buf = append(buf, 1)
 				buf = append(buf, target[:]...)
 				var lenb [4]byte

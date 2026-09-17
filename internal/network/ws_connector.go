@@ -80,14 +80,26 @@ func (c *WSConnector) Close() {
 	_ = c.conn.Close(websocket.StatusNormalClosure, "closing")
 }
 
-// readMessage reads exactly one relay protocol message from r into a
-// precisely-sized mem.Buffer, parsing the fixed header first to compute the
-// exact allocation size.
+// readMessageWithFixedFromID reads exactly one relay protocol message from r
+// into a precisely-sized mem.Buffer, parsing the fixed header first to
+// compute the exact allocation size.
 //
-// Layout: FromID(32) | ToIDsLen(1) | ToIDs(N*32) | DataLen(4) | Data(DataLen)
+// Wire layout (client -> server): ToIDsLen(1) | ToIDs(N*32) | DataLen(4) | Data(DataLen)
+//
+// The wire never carries a FromID: the server already knows the sender's
+// identity from authentication (see network.WSConnector.pubKey), so trusting
+// a client-supplied FromID would let a connection claim to be anyone. Instead
+// fromID (the caller's authenticated identity) is written directly into the
+// first 32 bytes of the returned buffer's in-memory core.Message layout
+// ([FromID:32][ToIDsLen:1][ToIDs:N*32][DataLen:4][Data]) — fixed by the
+// caller, never by wire content, hence the name. This is the only place that
+// ever writes FromID, so every buffer this function returns already carries
+// a trustworthy identity; the App (see relayer.Relayer.HandleMessage) does
+// not need to touch it.
 //
 // Returns:
-//   - (buf, nil)           — valid message, caller owns buf
+//   - (buf, nil)           — valid message, caller owns buf; buf[0:32] already
+//     equals fromID
 //   - (nil, errSkipMessage) — nTo==0, reader drained, connection continues
 //   - (nil, ErrInvalidMessage) — protocol violation (nTo>max, a repeated
 //     recipient in ToIDs, or trailing bytes); caller closes connection
@@ -96,14 +108,14 @@ func (c *WSConnector) Close() {
 //
 // errSkipMessage paths drain r to EOF so the connection can continue.
 // All other error paths do not drain (caller will close the connection).
-func readMessage(r io.Reader, maxDataLen int) (*mem.Buffer, error) {
-	// Step 1: fixed prefix — FromID(32) + ToIDsLen(1)
-	var hdr [33]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+func readMessageWithFixedFromID(r io.Reader, maxDataLen int, fromID [32]byte) (*mem.Buffer, error) {
+	// Step 1: ToIDsLen(1)
+	var nToByte [1]byte
+	if _, err := io.ReadFull(r, nToByte[:]); err != nil {
 		return nil, err
 	}
 
-	nTo := int(hdr[32])
+	nTo := int(nToByte[0])
 	if nTo == 0 {
 		// No recipients — valid frame but nothing to relay. Drain to keep connection alive.
 		_, _ = io.Copy(io.Discard, r)
@@ -136,12 +148,15 @@ func readMessage(r io.Reader, maxDataLen int) (*mem.Buffer, error) {
 		return nil, ErrMessageTooLarge
 	}
 
-	// Step 3: allocate exactly the bytes the message requires.
+	// Step 3: allocate exactly the bytes the in-memory Message layout needs:
+	// 32 reserved bytes for FromID (not on the wire) + ToIDsLen(1) +
+	// ToIDs(N*32) + DataLen(4) + Data.
 	prefixLen := 33 + tailN
 	totalLen := prefixLen + dataLen
 	buf := mem.NewBuffer(totalLen)
 	data := buf.Bytes()
-	copy(data[:33], hdr[:])
+	copy(data[:32], fromID[:])
+	data[32] = nToByte[0]
 	copy(data[33:prefixLen], tail[:tailN])
 
 	if dataLen > 0 {
@@ -199,7 +214,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 	go func(app core.App) {
 		for msg := range c.outChan {
 			wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
-			err := c.conn.Write(wctx, websocket.MessageBinary, msg.Msg)
+			err := c.conn.Write(wctx, websocket.MessageBinary, msg.Msg())
 			wcancel()
 			if msg.Buf != nil {
 				msg.Buf.Release()
@@ -230,7 +245,7 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 			continue
 		}
 
-		buf, err := readMessage(r, core.MaxMessageSize)
+		buf, err := readMessageWithFixedFromID(r, core.MaxMessageSize, c.pubKey)
 
 		// recvTime captured after full message is in memory — equivalent to conn.Read() semantics.
 		recvTime := time.Now()
@@ -249,9 +264,8 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 			return err
 		}
 
-		// nTo already validated (1..core.MaxTargetsPerMessage) inside readMessage.
-		msg := core.Message(buf.Bytes())
-		c.app.HandleMessage(c, msg, buf, recvTime)
+		// nTo already validated (1..core.MaxTargetsPerMessage) inside readMessageWithFixedFromID.
+		c.app.HandleMessage(c, core.OutMessage{RecvTime: recvTime, Buf: buf})
 		buf.Release()
 	}
 }

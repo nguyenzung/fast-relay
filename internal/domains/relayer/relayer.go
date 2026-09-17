@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/nguyenzung/relayer-server/internal/core"
-	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
 // Relayer manages a global registry of connectors keyed by pubKey.
@@ -167,7 +166,12 @@ func (r *Relayer) Count() int {
 // the recipient list is zeroed in-place (privacy, Relayer-specific) and the
 // message is pushed to each resolved connector via DeliverTo. A different
 // App can reuse the same two primitives with its own policy on top.
-func (r *Relayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
+//
+// m.Msg().FromID() is already the caller's authenticated identity (stamped
+// by network.readMessageWithFixedFromID before HandleMessage is ever
+// called), so unlike ToIDs there is nothing to strip or verify here.
+func (r *Relayer) HandleMessage(from core.Connector, m core.OutMessage) {
+	msg := m.Msg()
 	var targets [core.MaxTargetsPerMessage][32]byte
 	targetN := core.ExtractTargets(msg, from.ID(), &targets)
 
@@ -183,7 +187,7 @@ func (r *Relayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.
 	matched := 0
 	for _, target := range targets[:targetN] {
 		if dest, ok := r.GetConnectorByKey(target); ok {
-			if core.DeliverTo(dest, msg, buf, recvTime) {
+			if core.DeliverTo(dest, m) {
 				matched++
 			} else {
 				r.IncrementDeliveryFailure()

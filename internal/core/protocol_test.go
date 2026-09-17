@@ -133,11 +133,10 @@ func TestExtractTargets(t *testing.T) {
 func TestDeliverTo(t *testing.T) {
 	t.Run("success retains one extra reference the recipient owns", func(t *testing.T) {
 		dest := &fakeConnector{id: idFor(1), accept: true}
-		m := buildMessage(t, idFor(9), nil, []byte("payload"))
 		buf := mem.NewBuffer(4)
 		recvTime := time.Now()
 
-		ok := core.DeliverTo(dest, m, buf, recvTime)
+		ok := core.DeliverTo(dest, core.OutMessage{RecvTime: recvTime, Buf: buf})
 		if !ok {
 			t.Fatalf("DeliverTo() = false, want true")
 		}
@@ -160,10 +159,9 @@ func TestDeliverTo(t *testing.T) {
 
 	t.Run("dropped push undoes the retain, leaving refcount unchanged", func(t *testing.T) {
 		dest := &fakeConnector{id: idFor(1), accept: false}
-		m := buildMessage(t, idFor(9), nil, nil)
 		buf := mem.NewBuffer(4)
 
-		ok := core.DeliverTo(dest, m, buf, time.Now())
+		ok := core.DeliverTo(dest, core.OutMessage{RecvTime: time.Now(), Buf: buf})
 		if ok {
 			t.Fatalf("DeliverTo() = true, want false")
 		}
@@ -179,13 +177,13 @@ func TestDeliverTo(t *testing.T) {
 	t.Run("safe to call repeatedly against the same buffer", func(t *testing.T) {
 		destA := &fakeConnector{id: idFor(1), accept: true}
 		destB := &fakeConnector{id: idFor(2), accept: true}
-		m := buildMessage(t, idFor(9), nil, nil)
 		buf := mem.NewBuffer(4)
+		om := core.OutMessage{RecvTime: time.Now(), Buf: buf}
 
-		if !core.DeliverTo(destA, m, buf, time.Now()) {
+		if !core.DeliverTo(destA, om) {
 			t.Fatalf("DeliverTo(destA) = false, want true")
 		}
-		if !core.DeliverTo(destB, m, buf, time.Now()) {
+		if !core.DeliverTo(destB, om) {
 			t.Fatalf("DeliverTo(destB) = false, want true")
 		}
 

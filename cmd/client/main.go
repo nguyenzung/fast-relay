@@ -148,10 +148,10 @@ loop:
 				continue
 			}
 
-			// Build binary message
-			// FromID
+			// Build binary message. The wire carries no FromID — the server
+			// already knows our identity from authentication and stamps it
+			// onto the message before relaying it to recipients.
 			var buf []byte
-			buf = append(buf, pubKey[:]...)
 			// ToIDsLen
 			n := len(currentRecipients)
 			if n > core.MaxTargetsPerMessage {
@@ -179,9 +179,8 @@ loop:
 				var lenb [4]byte
 				binary.BigEndian.PutUint32(lenb[:], uint32(len(chunk)))
 
-				// build frame for this chunk
-				frame := make([]byte, 0, 32+1+len(currentRecipients)*32+4+len(chunk))
-				frame = append(frame, pubKey[:]...)
+				// build frame for this chunk (no FromID — see above)
+				frame := make([]byte, 0, 1+len(currentRecipients)*32+4+len(chunk))
 				n := len(currentRecipients)
 				if n > core.MaxTargetsPerMessage {
 					n = core.MaxTargetsPerMessage
