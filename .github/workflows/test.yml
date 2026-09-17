@@ -15,6 +15,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       CGO_ENABLED: 1
     steps:
@@ -33,10 +34,23 @@ jobs:
       - name: go vet
         run: make vet
 
-      # -race, excludes e2e/ by package path — the fast, deterministic gate
-      # for every PR. The heavy e2e churn test (internal/e2e, ~2 min, tuned
-      # against a dedicated multi-core machine) is intentionally left out of
-      # this gate to avoid flakiness on shared CI runners; run it locally
-      # with `make test-e2e` before merging changes that touch the hot path.
+      # -race, excludes e2e/ by package path — fails fast before the slower
+      # e2e step below.
       - name: Unit tests (race-enabled)
         run: make test-unit
+
+      # ~2 min, 200 simulated clients churning connect/disconnect against an
+      # in-process server. The liveness/delivery floors in
+      # e2e/churn_correctness_test.go were tuned on a dedicated multi-core
+      # machine (see its comment), so this can be flakier on a shared,
+      # 2-core CI runner than it is locally — a failure here is worth a
+      # rerun before assuming a real regression.
+      - name: E2E churn correctness test
+        run: make test-e2e
+
+      - name: Upload e2e log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-churn-correctness-log
+          path: test-result/e2e_churn_correctness.log
