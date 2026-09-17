@@ -20,16 +20,17 @@ The frame you **send** to the server and the frame you **receive** from it are n
 ```
 [0:32]   FromID      (32 bytes)   - Sender's public key, stamped by the server from its
                                      authenticated identity - not something the sender chose
-[32]     ToIDsLen    (1 byte)     - Always 0 in delivered frames (recipient list is zeroed
-                                     for privacy before relaying, see §4)
-[33:..]  ToIDs       (N*32 zero bytes)
+[32]     ToIDsLen    (1 byte)     - N, the recipient count the sender targeted - UNCHANGED
+                                     by relaying, only the bytes after it are zeroed
+[33:..]  ToIDs       (N*32 zero bytes) - zeroed for privacy (see §4), but still N*32 bytes
+                                     wide; DataLen starts after them, not at a fixed offset
 [?]      DataLen     (4 bytes)    - Payload length (big-endian uint32)
 [?]      Data        (variable)   - Payload (DataLen bytes)
 ```
 
 - **FromID**: 32-byte sender public key. Only present on delivered frames; never sent by the client and never trusted from the client even if it were — the server derives it from the authenticated connection.
-- **ToIDsLen**: Number of recipients N you are sending to (1-10; **0 = frame is silently discarded**, see §4). On a sent frame this is your target count; on a delivered frame it is always 0 (zeroed alongside `ToIDs`).
-- **ToIDs**: List of 32-byte recipient public keys you provide when sending (if ToIDsLen > 0). Every ID must be distinct — a repeated recipient is rejected (see §4).
+- **ToIDsLen**: Number of recipients N (1-10; **0 = frame is silently discarded**, see §4). On a sent frame this is your target count. On a delivered frame it is **the same N the sender sent, not 0** — the server only zeroes the bytes of `ToIDs` itself (see `ZeroToIDs` in the source), never the length byte. You must still read it to know how many (zeroed) `ToIDs` bytes to skip before `DataLen`.
+- **ToIDs**: On a sent frame, the list of 32-byte recipient public keys (if ToIDsLen > 0); every ID must be distinct — a repeated recipient is rejected (see §4). On a delivered frame, `N*32` zero bytes (the server strips the actual recipient list before relaying so recipients can't see each other's keys) — skip them by `ToIDsLen`, same as parsing a sent frame.
 - **DataLen**: 4-byte big-endian unsigned integer (uint32, supports large payloads)
 - **Data**: Binary payload (protocol message, encrypted or plaintext)
 
@@ -72,7 +73,8 @@ There is no server-side broadcast: the relay never fans a message out to "everyo
 Delivered frames have the server -> client shape from §1 — they **do** carry FromID:
 
 - Parse FromID (sender pubkey, stamped by the server — trust it, it is not the sender's own claim)
-- Read ToIDsLen (always 0 in a delivered frame)
+- Read ToIDsLen (N, the sender's original recipient count — **not 0**; only the bytes after it are zeroed)
+- Skip N*32 bytes of zeroed ToIDs
 - Read DataLen (4 bytes, big-endian uint32)
 - Read Data (payload)
 
@@ -82,6 +84,7 @@ Delivered frames have the server -> client shape from §1 — they **do** carry 
 - DataLen is big-endian (network order) and encoded as a 4-byte uint32
 - The relay server does not inspect or modify Data; encryption is end-to-end
 - The frame you send has no FromID; the frame you receive always does (server-stamped) — see §1
+- The frame you receive keeps the sender's original ToIDsLen (N) even though `ToIDs` itself is zeroed — DataLen is at offset `33 + N*32`, never a fixed offset — see §1/§3
 - If ToIDsLen = 0, the frame is **silently discarded** (no recipients); the connection stays open, nothing is relayed, and there is no broadcast fallback
 - If ToIDsLen > 10 (`MaxTargetsPerMessage`), the frame is a **protocol violation** and the connection is closed
 - ToIDs must not contain a repeated recipient — a duplicate is a **protocol violation** and the connection is closed (prevents amplifying delivery of a single frame to the same recipient more than once)
@@ -111,10 +114,13 @@ function encodeFrame(to: Uint8Array[], payload: Uint8Array): Uint8Array {
 // To send:
 // ws.send(encodeFrame([peerPub], payload));
 
-// Decodes a frame you RECEIVE (has FromID, ToIDsLen is always 0).
+// Decodes a frame you RECEIVE (has FromID; ToIDsLen is the sender's original
+// recipient count, NOT 0 - only the ToIDs bytes themselves are zeroed, so you
+// must still read ToIDsLen and skip that many *32 bytes before DataLen).
 function decodeFrame(data: Uint8Array): { from: Uint8Array; payload: Uint8Array } {
   const from = data.slice(0, 32);
-  const dataLenOffset = 33; // ToIDsLen is 0 in delivered frames, so no ToIDs to skip
+  const toIDsLen = data[32];
+  const dataLenOffset = 33 + toIDsLen * 32;
   const payloadLen =
     (data[dataLenOffset] << 24) |
     (data[dataLenOffset + 1] << 16) |

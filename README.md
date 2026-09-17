@@ -28,13 +28,14 @@ Data     (DataLen B)  — message payload
 # Server -> client (delivered)
 FromID   (32 bytes)   — sender public key, stamped by the server from the authenticated
                          connection, never from the client's own frame
-ToIDsLen  (1 byte)    — always 0 (ToIDs is zeroed before relaying, see below)
+ToIDsLen  (1 byte)    — still N, the sender's original recipient count (NOT zeroed —
+                         only the ToIDs bytes below are, see below)
 ToIDs    (N × 32 B)   — zero bytes
-DataLen   (4 bytes)   — payload length in bytes (big-endian uint32)
+DataLen   (4 bytes)   — payload length in bytes (big-endian uint32), at offset 33+N*32
 Data     (DataLen B)  — message payload
 ```
 
-Before forwarding, the server zeroes the `ToIDs` field in-place so recipients cannot see each other's public keys, and stamps `FromID` with the sender's authenticated pubkey so recipients cannot be shown a spoofed identity.
+Before forwarding, the server zeroes the `ToIDs` bytes in-place (not the `ToIDsLen` count itself) so recipients cannot see each other's public keys, and stamps `FromID` with the sender's authenticated pubkey so recipients cannot be shown a spoofed identity. A delivered frame's `DataLen`/`Data` therefore start at `33 + ToIDsLen*32`, exactly like a sent frame's `ToIDs`-skipping logic — never at a fixed offset.
 
 `MaxTargetsPerMessage = 10`. Frames with `ToIDsLen > 10` are treated as protocol violations and close the connection. Frames with `ToIDsLen = 0` are silently discarded (no recipients, connection stays open).
 
