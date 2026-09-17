@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/nguyenzung/relayer-server/internal/core"
+	"github.com/nguyenzung/relayer-server/internal/mem"
 )
 
 // idFor builds a distinguishable [32]byte id for test fixtures.
@@ -203,6 +204,34 @@ func TestMessage_ZeroToIDs(t *testing.T) {
 
 		if !bytes.Equal(truncated, before) {
 			t.Fatalf("ZeroToIDs() mutated a truncated message instead of no-op'ing")
+		}
+	})
+}
+
+func TestOutMessage_Msg(t *testing.T) {
+	t.Run("derives the Message view from Buf's bytes", func(t *testing.T) {
+		want := buildMessage(t, idFor(1), [][32]byte{idFor(2)}, nil)
+		buf := mem.NewBuffer(len(want))
+		defer buf.Release()
+		copy(buf.Bytes(), want)
+
+		om := core.OutMessage{Buf: buf}
+		if got := om.Msg(); !bytes.Equal(got, want) {
+			t.Fatalf("Msg() = %x, want %x", got, want)
+		}
+
+		// A mutation through Msg() must be visible through Buf too — they
+		// share the same backing array, not a copy.
+		om.Msg().ZeroToIDs()
+		if got := core.Message(buf.Bytes()).ToIDAt(0); got != ([32]byte{}) {
+			t.Fatalf("ToIDAt(0) after Msg().ZeroToIDs() = %x, want zero value", got)
+		}
+	})
+
+	t.Run("nil Buf yields nil Msg", func(t *testing.T) {
+		var om core.OutMessage
+		if got := om.Msg(); got != nil {
+			t.Fatalf("Msg() = %v, want nil", got)
 		}
 	})
 }

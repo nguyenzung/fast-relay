@@ -73,9 +73,10 @@ func (a *fakeApp) OnDisconnect(pubKey [32]byte) {
 	a.disconnected = append(a.disconnected, pubKey)
 }
 
-func (a *fakeApp) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
+func (a *fakeApp) HandleMessage(from core.Connector, m core.OutMessage) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	msg := m.Msg()
 	cp := make([]byte, len(msg))
 	copy(cp, msg)
 	a.handled = append(a.handled, cp)
@@ -103,12 +104,11 @@ func (a *fakeApp) FetchMetrics() any             { return nil }
 
 var _ core.App = (*fakeApp)(nil)
 
-// buildFrame encodes a minimal valid relay protocol frame:
-// FromID(32) | ToIDsLen(1)=1 | ToIDs(32) | DataLen(4) | Data.
+// buildFrame encodes a minimal valid relay protocol frame (wire carries no
+// FromID — see readMessageWithFixedFromID): ToIDsLen(1)=1 | ToIDs(32) | DataLen(4) | Data.
 func buildFrame(t *testing.T, data []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	buf.Write(make([]byte, 32)) // FromID (unused by readMessage)
 	buf.WriteByte(1)            // ToIDsLen = 1
 	buf.Write(make([]byte, 32)) // one recipient id (all-zero for the test)
 	var dataLen [4]byte
@@ -120,12 +120,11 @@ func buildFrame(t *testing.T, data []byte) []byte {
 
 // TestReadMessage_DuplicateTargetRejected is a regression test: a repeated
 // recipient in ToIDs amplifies delivery (core.ExtractTargets has no dedup of
-// its own) with no legitimate use, so readMessage must reject it as a
-// protocol violation instead of accepting it.
+// its own) with no legitimate use, so readMessageWithFixedFromID must reject
+// it as a protocol violation instead of accepting it.
 func TestReadMessage_DuplicateTargetRejected(t *testing.T) {
 	var buf bytes.Buffer
-	buf.Write(make([]byte, 32)) // FromID
-	buf.WriteByte(2)            // ToIDsLen
+	buf.WriteByte(2) // ToIDsLen
 	dup := make([]byte, 32)
 	dup[0] = 0x42
 	buf.Write(dup) // recipient 1
@@ -133,9 +132,9 @@ func TestReadMessage_DuplicateTargetRejected(t *testing.T) {
 	var dataLen [4]byte
 	buf.Write(dataLen[:])
 
-	_, err := readMessage(&buf, core.MaxMessageSize)
+	_, err := readMessageWithFixedFromID(&buf, core.MaxMessageSize, idFor(0x01))
 	if !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("readMessage() err = %v, want ErrInvalidMessage", err)
+		t.Fatalf("readMessageWithFixedFromID() err = %v, want ErrInvalidMessage", err)
 	}
 }
 
@@ -146,8 +145,7 @@ func TestReadMessage_DuplicateTargetRejected(t *testing.T) {
 func TestReadMessage_DistinctTargetsAccepted(t *testing.T) {
 	payload := []byte("hi")
 	var raw bytes.Buffer
-	raw.Write(make([]byte, 32)) // FromID
-	raw.WriteByte(2)            // ToIDsLen
+	raw.WriteByte(2) // ToIDsLen
 	id1, id2 := make([]byte, 32), make([]byte, 32)
 	id1[0], id2[0] = 0x01, 0x02
 	raw.Write(id1)
@@ -157,11 +155,50 @@ func TestReadMessage_DistinctTargetsAccepted(t *testing.T) {
 	raw.Write(dataLen[:])
 	raw.Write(payload)
 
-	buf, err := readMessage(&raw, core.MaxMessageSize)
+	buf, err := readMessageWithFixedFromID(&raw, core.MaxMessageSize, idFor(0x01))
 	if err != nil {
-		t.Fatalf("readMessage() err = %v, want nil", err)
+		t.Fatalf("readMessageWithFixedFromID() err = %v, want nil", err)
 	}
 	defer buf.Release()
+}
+
+// TestReadMessage_StampsProvidedFromID is a regression test for the wire
+// format: readMessageWithFixedFromID must not read a FromID off r at all
+// (the wire starts directly with ToIDsLen) and must instead write the fromID
+// argument into the returned buffer's first 32 bytes — the only place FromID
+// is ever set, so the App never needs to (and cannot be tricked into
+// trusting a client-supplied one).
+func TestReadMessage_StampsProvidedFromID(t *testing.T) {
+	payload := []byte("hi")
+	var raw bytes.Buffer
+	raw.WriteByte(1) // ToIDsLen = 1
+	raw.Write(make([]byte, 32))
+	var dataLen [4]byte
+	binary.BigEndian.PutUint32(dataLen[:], uint32(len(payload)))
+	raw.Write(dataLen[:])
+	raw.Write(payload)
+
+	fromID := idFor(0xAA)
+	buf, err := readMessageWithFixedFromID(&raw, core.MaxMessageSize, fromID)
+	if err != nil {
+		t.Fatalf("readMessageWithFixedFromID() err = %v, want nil", err)
+	}
+	defer buf.Release()
+
+	msg := core.Message(buf.Bytes())
+	if got := msg.FromID(); got != fromID {
+		t.Fatalf("FromID() = %x, want %x (the fromID argument, not wire content)", got, fromID)
+	}
+	if got := msg.Payload(); string(got) != string(payload) {
+		t.Fatalf("Payload() = %q, want %q", got, payload)
+	}
+}
+
+// idFor builds a distinguishable [32]byte id for test fixtures.
+func idFor(b byte) [32]byte {
+	var id [32]byte
+	id[0] = b
+	return id
 }
 
 // TestReadWriteLoop_HappyPath proves the wsConn seam (UT.md item 1): ReadWriteLoop
@@ -190,6 +227,9 @@ func TestReadWriteLoop_HappyPath(t *testing.T) {
 	defer app.mu.Unlock()
 	if len(app.handled) != 1 {
 		t.Fatalf("expected 1 handled message, got %d", len(app.handled))
+	}
+	if got := core.Message(app.handled[0]).FromID(); got != pub {
+		t.Fatalf("handled message FromID = %x, want connector's authenticated pubkey %x", got, pub)
 	}
 	if len(app.disconnected) != 1 || app.disconnected[0] != pub {
 		t.Fatalf("expected OnDisconnect(%x), got %v", pub, app.disconnected)
@@ -222,7 +262,7 @@ func TestReadWriteLoop_WriteErrorDrainsQueue(t *testing.T) {
 	c := NewWSConnector(conn, pub, app, 8)
 
 	buf := mem.NewBuffer(4)
-	msg := core.OutMessage{Msg: core.Message(buf.Bytes()), RecvTime: time.Now(), Buf: buf}
+	msg := core.OutMessage{RecvTime: time.Now(), Buf: buf}
 	if !c.SafePush(msg) {
 		t.Fatalf("SafePush failed before loop started")
 	}

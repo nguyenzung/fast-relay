@@ -46,7 +46,7 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 
 - **`App` Interface (`app.go`)**: The pluggability seam of the system. `internal/network` and `internal/server` depend only on this interface, never on a concrete app type:
   - **Connection lifecycle**: `OnConnect(pubKey, connector)`, `OnDisconnect(pubKey)`, `Count()`.
-  - **Routing (the seam)**: `HandleMessage(from, msg, buf, recvTime)` — called once per successfully framed inbound message. The App owns the entire routing decision: which recipients (if any) receive it, whether/how the recipient list is stripped before forwarding, and which counters apply. `internal/network` calls this and otherwise has no opinion on what a message means. `buf` ownership stays with the caller: `internal/network` holds the original reference from `readMessage()` and releases it right after `HandleMessage` returns; `HandleMessage` must not release that reference itself, only `Retain()` additional ones (via `DeliverTo`, see below) for each connector it pushes to.
+  - **Routing (the seam)**: `HandleMessage(from, m)` — called once per successfully framed inbound message. The App owns the entire routing decision: which recipients (if any) receive it, whether/how the recipient list is stripped before forwarding, and which counters apply. `internal/network` calls this and otherwise has no opinion on what a message means. `m.Buf` ownership stays with the caller: `internal/network` holds the original reference from `readMessageWithFixedFromID()` and releases it right after `HandleMessage` returns; `HandleMessage` must not release that reference itself, only `Retain()` additional ones (via `DeliverTo`, see below) for each connector it pushes to.
   - **Delivery-outcome hooks**: `IncrementDeliverySuccess()`, `IncrementDeliveryFailure()`, `RecordLatency(d)`. These are called by the connector write pump after the actual socket write outcome is known.
   - **Metrics lifecycle/reporting**: `core.App` embeds `Metrics` with `StartRecording()`, `StopRecording()`, `FetchMetrics() any` so `internal/server` can start/stop collection and expose an opaque app-defined snapshot without knowing app internals.
   - **Shutdown**: `Close()`.
@@ -56,7 +56,7 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
   type App interface {
       OnConnect(pubKey [32]byte, c Connector)
       OnDisconnect(pubKey [32]byte)
-      HandleMessage(from Connector, msg Message, buf *mem.Buffer, recvTime time.Time)
+      HandleMessage(from Connector, m OutMessage)
       Count() int
       IncrementDeliverySuccess()
       IncrementDeliveryFailure()
@@ -84,11 +84,11 @@ Provides a cross-platform `Buffer` abstraction for raw byte allocation without u
 
 - **`Message` (`message.go`)**: A `[]byte` view over the raw buffer. Helper methods (`ToIDsLen()`, `ToIDAt()`, `ZeroToIDs()`) operate directly on fixed byte offsets, with no struct allocation or deserialization.
 
-- **`OutMessage` (`message.go`)**: Carries a `Message` and its receive timestamp across channels. Passed by value to avoid a separate pointer allocation per message in the common case. Contains a `Buf *mem.Buffer` field — on Linux this holds the jemalloc-backed region; on other platforms it is nil. Each recipient's write pump calls `Buf.Release()` after writing (nil-safe), and the last release frees the backing memory.
+- **`OutMessage` (`message.go`)**: Carries the receive timestamp and a `Buf *mem.Buffer` across channels. `Msg()` derives the zero-copy `Message` view from `Buf` when needed, so the buffer remains the single source of truth. Passed by value to avoid a separate pointer allocation per message in the common case. On Linux `Buf` holds the jemalloc-backed region; on other platforms its internal pointer is nil. Each recipient's write pump calls `Buf.Release()` after writing, and the last release frees the backing memory.
 
 - **Protocol primitives (`protocol.go`)**: Mechanical, policy-free operations shared across `internal/domains` `App` implementations, so each new domain doesn't have to re-derive them:
   - `ExtractTargets(msg, self, &dst)` — reads `msg.ToIDs`, excludes `self`, writes into a caller-provided fixed array (no allocation).
-  - `DeliverTo(dest, msg, buf, recvTime)` — the retain/push/release-on-drop dance for pushing `msg` to one `Connector`. It only ever manages the reference it creates via its own `Retain()`; it never releases the original reference (that belongs to `internal/network`, see above). This is the easiest place to introduce a refcount bug by hand, so it exists once here instead of being copy-pasted per `App`.
+  - `DeliverTo(dest, m)` — the retain/push/release-on-drop dance for pushing an `OutMessage` to one `Connector`. It only ever manages the reference it creates via its own `Retain()`; it never releases the original reference (that belongs to `internal/network`, see above). This is the easiest place to introduce a refcount bug by hand, so it exists once here instead of being copy-pasted per `App`.
   - Both are opinion-free: they don't decide what counts as `processed`, whether to strip the recipient list, or which counter to bump on failure — that's still each `App`'s own policy (see §2.3).
 
 ---
@@ -99,7 +99,7 @@ Concrete `App` implementations live here, outside `internal/core`. Adding a new 
 
 - **`Relayer` (`relayer.go`)**: The default implementation of `core.App`, providing targeted multicast — one of potentially several `App`s this package can hold:
   - **Registry**: Manages active connections using `sync.Map`, optimized for read-heavy workloads where routing lookups greatly outnumber register/unregister events. `OnConnect`/`OnDisconnect` are backed by this map; `GetConnectorByKey` is a private-to-the-package lookup helper used only by `HandleMessage` below (it is not part of `core.App`).
-  - **`HandleMessage`**: The routing decision itself, composed from the shared primitives in §2.2 plus Relayer's own policy: `core.ExtractTargets` reads recipients from `msg.ToIDs` excluding the sender; if none remain, the frame is dropped without counting it as `processed`. Otherwise `processed` is incremented, the recipient list is zeroed in-place (`ZeroToIDs`, for privacy — Relayer-specific policy, not every `App` needs this), each target is looked up via the registry, and `core.DeliverTo` pushes to it. A different `App` (e.g. a game server) can reuse `ExtractTargets`/`DeliverTo` as-is, or ignore them entirely and route through server-side game state instead of a peer registry — the primitives don't force any particular routing semantics.
+  - **`HandleMessage`**: The routing decision itself, composed from the shared primitives in §2.2 plus Relayer's own policy: `core.ExtractTargets` reads recipients from `m.Msg()` excluding the sender; if none remain, the frame is dropped without counting it as `processed`. Otherwise `processed` is incremented, the recipient list is zeroed in-place (`ZeroToIDs`, for privacy — Relayer-specific policy, not every `App` needs this), each target is looked up via the registry, and `core.DeliverTo` pushes `m` to it. A different `App` (e.g. a game server) can reuse `ExtractTargets`/`DeliverTo` as-is, or ignore them entirely and route through server-side game state instead of a peer registry — the primitives don't force any particular routing semantics.
   - **Metrics**: `atomic.Uint64` counters (`processed`, `delivered`, `noRecip`) avoid mutex contention on the hot path.
   - **Latency Monitoring**: A background worker collects latency samples. Uses the Welford algorithm for online mean/variance and **Reservoir Sampling** (fixed sample size) to approximate percentiles (p50, p95, p99) with bounded memory.
 
@@ -112,10 +112,10 @@ Concrete `App` implementations live here, outside `internal/core`. Adding a new 
 - **Asynchronous I/O**: Each `WSConnector` owns a bounded `outChan` (buffered channel). `SafePush` acquires an `RLock` to coordinate safely with `Close()` — preventing sends into a closed channel — then attempts a non-blocking send. If `outChan` is full, the message is dropped for that destination (*drop-on-full*). The `outChan` capacity is set by the caller of `NewWSConnector`; if `<= 0` it defaults to 256. Both `outChan` capacity and `MaxMessageSize` should be tuned to the expected payload size and burst characteristics of the deployment.
 
 - **ReadWriteLoop**: Each connection maintains two goroutines:
-  - **Read Pump**: Uses `conn.Reader()` and `readMessage()` to incrementally parse the fixed wire envelope (`FromID | ToIDsLen | ToIDs | DataLen | Data` — this framing is protocol-level, not app-specific, and stays in this package), allocate one precisely-sized `mem.Buffer`, and read the payload directly into that buffer. The resulting `core.Message` is then handed off whole to `app.HandleMessage(c, msg, buf, recvTime)` — this package does not interpret `ToIDs`/`Data` beyond the fixed envelope offsets; the routing decision belongs entirely to the `App` (§2.3). On disconnect, calls `app.OnDisconnect(pubKey)`.
+  - **Read Pump**: Uses `conn.Reader()` and `readMessageWithFixedFromID()` to parse the client-to-server wire envelope (`ToIDsLen | ToIDs | DataLen | Data`), stamp the authenticated `pubKey` into the in-memory `Message` layout, allocate one precisely-sized `mem.Buffer`, and read the payload directly into that buffer. The resulting `core.OutMessage` is handed off to `app.HandleMessage(c, m)` — this package does not interpret `ToIDs`/`Data` beyond the fixed envelope offsets; the routing decision belongs entirely to the `App` (§2.3). On disconnect, calls `app.OnDisconnect(pubKey)`.
   - **Write Pump**: Takes `OutMessage` values from `outChan`, writes to the socket with a 5-second per-write timeout, then calls `msg.Buf.Release()` if `Buf` is non-nil. When the last recipient releases, `C.free` is called immediately. On write error the pump closes the connection, calls `app.IncrementDeliveryFailure()`, and drains remaining queued messages, releasing each buffer before exiting. On success it calls `app.IncrementDeliverySuccess()` and `app.RecordLatency(...)` — these are generic delivery-outcome hooks, not part of the routing decision, so they stay here regardless of which `App` is plugged in.
 
-- **Incremental Read + Exact-size Allocation**: `readMessage()` first reads the small protocol header to learn the exact payload size, then allocates one `mem.Buffer` of that size and reads the payload directly in. This avoids the older pattern of reading into a Go-heap slice and cloning into a `mem.Buffer`. One buffer is shared across all recipients via `Retain`/`Release` reference counting.
+- **Incremental Read + Exact-size Allocation**: `readMessageWithFixedFromID()` first reads the small client protocol header to learn the exact payload size, then allocates one `mem.Buffer` for the in-memory message layout and reads the payload directly in. This avoids the older pattern of reading into a Go-heap slice and cloning into a `mem.Buffer`. One buffer is shared across all recipients via `Retain`/`Release` reference counting.
 
 ---
 
@@ -159,8 +159,8 @@ Concrete `App` implementations live here, outside `internal/core`. Adding a new 
 ### B. Message Routing Phase
 
 1. Client A sends a binary frame.
-2. Read pump parses the frame via `readMessage()` into a `core.Message` + `mem.Buffer`, calls `app.HandleMessage(c, msg, buf, recvTime)` synchronously, then releases its own reference to `buf` — network stops interpreting the message here; everything else below is `Relayer`'s (the default `App`) behavior, not network's.
-3. `Relayer.HandleMessage` (via `core.ExtractTargets`) filters the recipient list — removing self. If no valid targets remain, the frame is skipped without incrementing `processed` (and without touching `buf`'s refcount — see §2.2 on `buf` ownership).
+2. Read pump parses the client frame via `readMessageWithFixedFromID()` into a `core.OutMessage`, calls `app.HandleMessage(c, m)` synchronously, then releases its own reference to `m.Buf` — network stops interpreting the message here; everything else below is `Relayer`'s (the default `App`) behavior, not network's.
+3. `Relayer.HandleMessage` (via `core.ExtractTargets`) filters the recipient list — removing self. If no valid targets remain, the frame is skipped without incrementing `processed` (and without touching `m.Buf`'s refcount — see §2.2 on buffer ownership).
 4. With at least one valid target, `processed` is incremented, `ZeroToIDs()` is called in-place, and each target is looked up via the internal registry and pushed via `core.DeliverTo` — non-blocking. A different `App` would perform entirely different steps here.
 
 ### C. Delivery Phase
@@ -226,7 +226,7 @@ Three decisions cooperate to keep p99 below 100 µs:
 
 2. **Low-contention routing path.** `sync.Map` stores a read-only atomic snapshot of the connection registry. Under the read-dominant access pattern (many routing lookups, rare register/unregister), lookups proceed without a write-heavy mutex. Each `SafePush` call does acquire a brief `RLock` (shared with all concurrent pushes, contending only against `Close()`), but releases it immediately after the non-blocking channel operation. `atomic.Uint64` metrics counters remove mutex overhead from the hot-path counters entirely.
 
-3. **No serialization on the receive path.** `readMessage()` reads fixed offsets. `ToIDsLen()`, `ToIDAt()`, and `ZeroToIDs()` operate directly on the raw byte slice. There is no JSON, protobuf, or struct construction until after routing is complete.
+3. **No serialization on the receive path.** `readMessageWithFixedFromID()` reads fixed offsets. `ToIDsLen()`, `ToIDAt()`, and `ZeroToIDs()` operate directly on the raw byte slice. There is no JSON, protobuf, or struct construction until after routing is complete.
 
 ### 5.4. ~97 KB/connection Memory Footprint
 
@@ -256,7 +256,7 @@ RSS stabilized at ~1.97–1.99 GB throughout a churn test where clients continuo
 
 3. **`atomic` counters eliminate mutex round-trips on metrics.** At 105,000 operations/second across many goroutines, `atomic.Add` removes a meaningful slice of per-operation overhead compared to a mutex-guarded increment.
 
-4. **Zero-fill elimination.** `readMessage()` allocates via jemalloc (no zero-fill) and reads the payload directly into the final buffer. The older pattern — `conn.Read` into a Go-heap slice, then `copy` into `mem.Buffer` — performed an extra zero-fill and an extra copy on every message.
+4. **Zero-fill elimination.** `readMessageWithFixedFromID()` allocates via jemalloc (no zero-fill) and reads the payload directly into the final buffer. The older pattern — `conn.Read` into a Go-heap slice, then `copy` into `mem.Buffer` — performed an extra zero-fill and an extra copy on every message.
 
 ### 5.7. GC Behavior Under Load
 
@@ -279,14 +279,16 @@ The server's performance comes from a copy-minimized binary relay pipeline rathe
 Clients send `websocket.MessageBinary` frames in a compact fixed-layout format:
 
 ```
-FromID(32) | ToIDsLen(1) | ToIDs(N×32) | DataLen(4) | Data(DataLen)
+ToIDsLen(1) | ToIDs(N×32) | DataLen(4) | Data(DataLen)
 ```
+
+The server does not accept a client-supplied `FromID`. It stamps the authenticated identity into the in-memory message before calling the App; delivered server-to-client frames use the full layout with `FromID(32)` and a privacy-zeroed recipient list.
 
 Recipient IDs and payload length are read from fixed byte offsets. There is no JSON, protobuf, map, or nested struct on the routing path. CPU work per message is predictable and allocation-free at the parsing step.
 
 ### 6.2. Incremental Read with Exact-size Allocation
 
-`readMessage()` reads the protocol prefix first, validates `ToIDsLen` and `DataLen`, then allocates one `mem.Buffer` of the exact required size and reads the payload directly into it.
+`readMessageWithFixedFromID()` reads the client protocol prefix first, validates `ToIDsLen` and `DataLen`, then allocates one `mem.Buffer` for the in-memory message layout and reads the payload directly into it.
 
 This avoids the older pattern:
 
@@ -297,7 +299,7 @@ WebSocket read → Go heap []byte → mem.Buffer clone → relay
 The current path is:
 
 ```
-WebSocket reader → parse header → allocate exact mem.Buffer → read payload into final buffer
+  WebSocket reader → parse client header → stamp authenticated FromID → allocate exact mem.Buffer → read payload into final buffer
 ```
 
 This removes one full-message copy and one Go heap allocation from every received frame.
@@ -378,7 +380,7 @@ Everything above (§1–§6) describes a single process. This section is about w
 `internal/network`'s entire job is:
 
 ```text
-WebSocket frame → parse common binary envelope → app.HandleMessage(from, msg, buf, recvTime)
+WebSocket frame → parse client envelope → stamp authenticated identity → app.HandleMessage(from, m)
 ```
 
 It has no opinion on what happens next. `core.App.HandleMessage` owns the complete routing decision (§2.2), so a domain implementation is free to do more than look up a local `sync.Map`. Nothing in `core`, `network`, or `server` assumes the recipient is reachable through a local `Connector` — that assumption lives entirely inside `domains.Relayer.HandleMessage`, which is one possible policy, not the only one.
@@ -386,18 +388,19 @@ It has no opinion on what happens next. `core.App.HandleMessage` owns the comple
 A cluster-aware `App` can be dropped in without touching any other layer:
 
 ```go
-func (r *DistributedRelayer) HandleMessage(from core.Connector, msg core.Message, buf *mem.Buffer, recvTime time.Time) {
+func (r *DistributedRelayer) HandleMessage(from core.Connector, m core.OutMessage) {
     var targets [core.MaxTargetsPerMessage][32]byte
+  msg := m.Msg()
     n := core.ExtractTargets(msg, from.ID(), &targets)
     msg.ZeroToIDs()
 
     for _, target := range targets[:n] {
         if dest, ok := r.localRegistry.GetConnectorByKey(target); ok {
-            core.DeliverTo(dest, msg, buf, recvTime) // local hop, existing primitive
+            core.DeliverTo(dest, m) // local hop, existing primitive
             continue
         }
         if node, ok := r.directory.LookupOwner(target); ok {
-            r.interNode.Forward(node, target, msg, buf, recvTime) // this node's own logic
+            r.interNode.Forward(node, target, m) // this node's own logic
             continue
         }
         r.IncrementDeliveryFailure()

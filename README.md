@@ -8,7 +8,7 @@ The server is designed to handle tens of thousands of concurrent connections wit
 
 - **PubKey-based routing**: Route messages directly by 32-byte public key — no account system required.
 - **Targeted multicast**: One frame can name up to 10 recipients; the server routes to each in one pass.
-- **Copy-minimized hot path**: `readMessage()` reads the frame header first, allocates one exactly-sized buffer, and reads the payload directly in — no intermediate Go-heap copy. One buffer is shared across all recipients via reference counting (`Retain`/`Release`).
+- **Copy-minimized hot path**: `readMessageWithFixedFromID()` reads the client frame header first, stamps the authenticated sender identity, allocates one exactly-sized buffer, and reads the payload directly in — no intermediate Go-heap copy. One buffer is shared across all recipients via reference counting (`Retain`/`Release`).
 - **jemalloc on Linux**: Message buffers are allocated outside the Go heap (no zero-fill, no GC finalization). Released deterministically when the last write pump finishes.
 - **Bounded per-connection memory**: ~97 KB RSS per connection at 21,000 concurrent connections.
 - **Drop-on-full isolation**: Each connection has its own bounded outbound queue. A slow client is dropped rather than blocking others.
@@ -16,15 +16,26 @@ The server is designed to handle tens of thousands of concurrent connections wit
 
 ## Binary Protocol
 
+The frame a client sends and the frame it receives are not the same shape — the server is the sole source of truth for sender identity (from `?pub=` at connect time), so it never trusts a client-supplied FromID.
+
 ```text
-FromID   (32 bytes)   — sender public key
+# Client -> server
 ToIDsLen  (1 byte)    — number of recipients N (1–10; 0 = frame is discarded)
 ToIDs    (N × 32 B)   — recipient public keys
 DataLen   (4 bytes)   — payload length in bytes (big-endian uint32)
 Data     (DataLen B)  — message payload
+
+# Server -> client (delivered)
+FromID   (32 bytes)   — sender public key, stamped by the server from the authenticated
+                         connection, never from the client's own frame
+ToIDsLen  (1 byte)    — still N, the sender's original recipient count (NOT zeroed —
+                         only the ToIDs bytes below are, see below)
+ToIDs    (N × 32 B)   — zero bytes
+DataLen   (4 bytes)   — payload length in bytes (big-endian uint32), at offset 33+N*32
+Data     (DataLen B)  — message payload
 ```
 
-Before forwarding, the server zeroes the `ToIDs` field in-place so recipients cannot see each other's public keys.
+Before forwarding, the server zeroes the `ToIDs` bytes in-place (not the `ToIDsLen` count itself) so recipients cannot see each other's public keys, and stamps `FromID` with the sender's authenticated pubkey so recipients cannot be shown a spoofed identity. A delivered frame's `DataLen`/`Data` therefore start at `33 + ToIDsLen*32`, exactly like a sent frame's `ToIDs`-skipping logic — never at a fixed offset.
 
 `MaxTargetsPerMessage = 10`. Frames with `ToIDsLen > 10` are treated as protocol violations and close the connection. Frames with `ToIDsLen = 0` are silently discarded (no recipients, connection stays open).
 

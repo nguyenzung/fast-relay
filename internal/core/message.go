@@ -86,10 +86,21 @@ func (m Message) ZeroToIDs() {
 	}
 }
 
+// OutMessage bundles a message's backing buffer with the time it was
+// received. Buf is the single source of truth for the bytes; Msg() derives
+// the typed Message view from it on demand instead of storing a second copy
+// of the same slice header, so there is nothing that can drift out of sync.
 type OutMessage struct {
-	Msg      Message
 	RecvTime time.Time
 	// Buf keeps the backing allocator alive until this message is consumed.
-	// On Linux, Buf holds a CGO malloc'd region; on other platforms it is nil.
+	// On Linux, Buf holds a CGO malloc'd region; on other platforms it's internal ptr is nil.
 	Buf *mem.Buffer
+}
+
+// Msg returns a Message view over Buf's bytes. Returns nil if Buf is nil.
+func (o OutMessage) Msg() Message {
+	if o.Buf == nil {
+		return nil
+	}
+	return Message(o.Buf.Bytes())
 }

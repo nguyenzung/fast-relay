@@ -300,10 +300,10 @@ func runConnector(ctx context.Context, addr string, pubs [][32]byte, pubsStr []s
 				targetIdx = i
 			}
 
-			// targeted message (nTo=0 broadcast is not supported by the server)
+			// targeted message (nTo=0 broadcast is not supported by the server).
+			// Wire carries no FromID; the server stamps our authenticated
+			// identity before relaying.
 			var buf []byte
-			fromKey := pubs[idx]
-			buf = append(buf, fromKey[:]...)
 			buf = append(buf, 1)
 			// use raw bytes from pubs slice
 			target := pubs[targetIdx]

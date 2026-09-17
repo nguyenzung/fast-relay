@@ -1,10 +1,6 @@
 package core
 
-import (
-	"time"
-
-	"github.com/nguyenzung/relayer-server/internal/mem"
-)
+import "time"
 
 // App is the pluggability seam of the system. internal/network and
 // internal/server depend only on this interface, never on a concrete app
@@ -27,13 +23,19 @@ type App interface {
 	// the recipient list is stripped before forwarding, and which counters
 	// apply.
 	//
-	// buf ownership: the caller (internal/network) holds buf's original
+	// m.Msg().FromID() is guaranteed by the caller (internal/network) to be
+	// the connection's authenticated identity - it is stamped onto m.Buf at
+	// read time (see network.readMessageWithFixedFromID), never read off the
+	// wire, so HandleMessage must not (and need not) re-verify or overwrite
+	// it.
+	//
+	// buf ownership: the caller (internal/network) holds m.Buf's original
 	// reference and releases it right after HandleMessage returns.
 	// HandleMessage must NOT release that reference itself - it may only
 	// Retain() additional references for connectors it pushes to (see
 	// DeliverTo in protocol.go), each released independently by that
 	// recipient's own write pump once written.
-	HandleMessage(from Connector, msg Message, buf *mem.Buffer, recvTime time.Time)
+	HandleMessage(from Connector, m OutMessage)
 
 	// Count returns the current (approximate) number of registered
 	// connectors. Safe to call concurrently with OnConnect/OnDisconnect;
