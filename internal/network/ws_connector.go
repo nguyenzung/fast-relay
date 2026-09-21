@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -191,14 +192,13 @@ func readMessageWithFixedFromID(r io.Reader, maxDataLen int, fromID [32]byte) (*
 // core.MaxTargetsPerMessage (already enforced by the caller), so the O(n^2)
 // comparison is at most 45 comparisons of 32 bytes each.
 func hasDuplicateTarget(toIDs []byte, n int) bool {
-	id := func(i int) [32]byte {
-		var out [32]byte
-		copy(out[:], toIDs[i*32:i*32+32])
-		return out
-	}
-	for i := 0; i < n; i++ {
+	const idSize = 32
+
+	for i := 0; i < n-1; i++ {
+		a := toIDs[i*idSize : (i+1)*idSize]
+
 		for j := i + 1; j < n; j++ {
-			if id(i) == id(j) {
+			if bytes.Equal(a, toIDs[j*idSize:(j+1)*idSize]) {
 				return true
 			}
 		}
@@ -249,18 +249,16 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 
 		// recvTime captured after full message is in memory — equivalent to conn.Read() semantics.
 		recvTime := time.Now()
-		if errors.Is(err, errSkipMessage) {
+		switch {
+		case errors.Is(err, errSkipMessage):
 			continue
-		}
-		if errors.Is(err, ErrMessageTooLarge) {
+		case errors.Is(err, ErrMessageTooLarge):
 			_ = c.conn.Close(websocket.StatusMessageTooBig, "message too large")
 			return err
-		}
-		if errors.Is(err, ErrInvalidMessage) {
+		case errors.Is(err, ErrInvalidMessage):
 			_ = c.conn.Close(websocket.StatusUnsupportedData, "invalid message")
 			return err
-		}
-		if err != nil {
+		case err != nil:
 			return err
 		}
 

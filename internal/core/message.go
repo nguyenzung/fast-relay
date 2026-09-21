@@ -78,11 +78,7 @@ func (m Message) ZeroToIDs() {
 	start := 33
 	end := 33 + (n * 32)
 	if len(m) >= end {
-		// Compilers optimize this range-zeroing into a vectorized memclr
-		targetArea := m[start:end]
-		for i := range targetArea {
-			targetArea[i] = 0
-		}
+		clear(m[start:end])
 	}
 }
 
