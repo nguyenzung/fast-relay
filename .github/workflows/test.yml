@@ -5,6 +5,11 @@ on:
     branches:
       - main
       - dev
+    # Skip doc-only PRs. This is file-level, not diff-level: a comment-only
+    # change inside a .go file still triggers, since GitHub Actions has no
+    # way to filter on what changed within a file.
+    paths-ignore:
+      - '**/*.md'
 
 # Cancel a stale run for the same PR when new commits are pushed, so we
 # don't burn CI minutes on outdated diffs.
