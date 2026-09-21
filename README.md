@@ -1,22 +1,28 @@
 # Fast Relay
 
-Fast Relay is a high-performance WebSocket relay server written in Go, optimized for message routing between clients identified by 32-byte public keys.
+Fast Relay is a WebSocket relay server written in Go. It routes binary messages between clients, where each client is identified by a 32-byte public key instead of a username or account.
 
-The server is designed to handle tens of thousands of concurrent connections with sub-millisecond delivery latency and predictable memory usage through a copy-minimized binary relay pipeline.
+In plain terms: a client connects, tells the server "I am pubkey X", and can then send a message to any other pubkey(s). The server does not know or care what's inside the message — it just delivers it to the right recipient(s), fast.
+
+It's built to handle tens of thousands of connections at once, deliver messages in well under a millisecond, and keep memory use per connection small and predictable.
 
 ## Key Features
 
-- **PubKey-based routing**: Route messages directly by 32-byte public key — no account system required.
-- **Targeted multicast**: One frame can name up to 10 recipients; the server routes to each in one pass.
-- **Copy-minimized hot path**: `readMessageWithFixedFromID()` reads the client frame header first, stamps the authenticated sender identity, allocates one exactly-sized buffer, and reads the payload directly in — no intermediate Go-heap copy. One buffer is shared across all recipients via reference counting (`Retain`/`Release`).
-- **jemalloc on Linux**: Message buffers are allocated outside the Go heap (no zero-fill, no GC finalization). Released deterministically when the last write pump finishes.
-- **Bounded per-connection memory**: ~97 KB RSS per connection at 21,000 concurrent connections.
-- **Drop-on-full isolation**: Each connection has its own bounded outbound queue. A slow client is dropped rather than blocking others.
-- **Metrics endpoint**: `/metrics` exposes active connections, throughput, latency percentiles, CPU, and memory in JSON.
+- **PubKey-based routing** — no accounts, no login flow. A client is simply "whoever holds this public key." Messages are routed straight to the target pubkey(s).
+- **Targeted multicast** — one message can list up to 10 recipients, and the server delivers to all of them in a single pass.
+- **Copy-minimized hot path** — the function that reads an incoming message (`readMessageWithFixedFromID()`) reads just enough of the header to know the exact message size, stamps the sender's verified identity onto it, and reads the payload straight into one right-sized buffer. No extra copy in between. That one buffer is then shared by every recipient (via reference counting — see below) instead of being duplicated per recipient.
+- **jemalloc on Linux** — message buffers are allocated outside Go's normal memory heap. This skips a zero-fill step Go would otherwise do on every allocation, and frees the memory immediately (not on the GC's schedule) once the last recipient has read it.
+- **Bounded per-connection memory** — about 97 KB of RAM per connection, measured at 21,000 concurrent connections.
+- **Drop-on-full isolation** — each connection has its own outgoing message queue with a fixed capacity. If a client is too slow to keep up and its queue fills up, new messages to it are dropped instead of piling up in memory or stalling everyone else.
+- **Metrics endpoint** — `/metrics` reports active connections, throughput, latency percentiles, CPU, and memory as JSON.
+
+### What "reference counting" means here
+
+When a message goes to multiple recipients, the server doesn't copy the message N times. It allocates the message once and keeps a counter of how many recipients still need to read it (`Retain()` adds to the counter, `Release()` subtracts). When the counter hits zero — meaning every recipient's write has finished — the memory is freed immediately.
 
 ## Binary Protocol
 
-The frame a client sends and the frame it receives are not the same shape — the server is the sole source of truth for sender identity (from `?pub=` at connect time), so it never trusts a client-supplied FromID.
+The frame a client **sends** and the frame it **receives** are shaped differently. That's on purpose: the server always knows who a client is (from `?pub=` at connection time), so it never trusts a client's own claim about who a message is "from" — it stamps that in itself.
 
 ```text
 # Client -> server
@@ -35,13 +41,17 @@ DataLen   (4 bytes)   — payload length in bytes (big-endian uint32), at offset
 Data     (DataLen B)  — message payload
 ```
 
-Before forwarding, the server zeroes the `ToIDs` bytes in-place (not the `ToIDsLen` count itself) so recipients cannot see each other's public keys, and stamps `FromID` with the sender's authenticated pubkey so recipients cannot be shown a spoofed identity. A delivered frame's `DataLen`/`Data` therefore start at `33 + ToIDsLen*32`, exactly like a sent frame's `ToIDs`-skipping logic — never at a fixed offset.
+Before forwarding a message, the server does two things to it in place:
+1. Zeroes out the `ToIDs` bytes, so a recipient can't see who else the message was sent to.
+2. Stamps `FromID` with the sender's real, authenticated pubkey, so a recipient can't be shown a spoofed sender.
 
-`MaxTargetsPerMessage = 10`. Frames with `ToIDsLen > 10` are treated as protocol violations and close the connection. Frames with `ToIDsLen = 0` are silently discarded (no recipients, connection stays open).
+One detail worth remembering: the delivered frame keeps the original `ToIDsLen` count (it's *not* zeroed, only the `ToIDs` key bytes are) — so a client reading a delivered frame must still read that count to know how many zero bytes to skip before `DataLen`. `DataLen`/`Data` always start at `33 + ToIDsLen*32`, never a fixed offset.
+
+`MaxTargetsPerMessage = 10`. A frame listing more than 10 recipients is treated as a protocol violation and the connection is closed. A frame listing 0 recipients is simply dropped (the connection stays open — this is not an error).
 
 ## Installation
 
-**Requirements**: Go 1.23+, Linux (for jemalloc; other platforms fall back to `make`).
+**Requirements**: Go 1.23+, Linux (for jemalloc; other platforms fall back to Go's built-in `make`).
 
 ```bash
 git clone https://github.com/nguyenzung/relay-server.git
@@ -62,7 +72,7 @@ make build
 
 ## Performance (Linux, 38-hour churn test)
 
-Tested on a single machine (Acer Nitro V15, 16 logical CPUs) with server and load generator co-located.
+Tested on a single machine (Acer Nitro V15, 16 logical CPUs) with the server and load generator running side by side ("churn" means clients are continuously connecting and disconnecting throughout the test, not just holding one steady connection).
 
 | Metric | Value |
 |---|---|
@@ -113,19 +123,19 @@ make churn ARGS="-n 1000 -m 10 -addr localhost:8080"
 }
 ```
 
-`active_connections` and `app_metrics` reflect this process only — in a multi-node deployment, each node exposes its own `/metrics`; there is no built-in cluster-wide aggregation (see [Distributed Deployment](#distributed-deployment) below).
+`active_connections` and `app_metrics` describe only this one process. If you run several nodes, each exposes its own `/metrics`, and nothing aggregates them across nodes for you — see [Distributed Deployment](#distributed-deployment) below.
 
 ## Architecture
 
-See [`Architecture.md`](Architecture.md) for component details, data flow, and the performance model explaining why the server achieves these numbers.
+See [`Architecture.md`](Architecture.md) for how the pieces fit together, how a message flows through the system, and why the server performs the way it does.
 
 ## Distributed Deployment
 
-This server is single-node: there is no built-in cluster membership, cross-node routing, or replication. What it does provide is a routing seam that a distributed implementation can be built on without changing the transport.
+This server runs as a single process — there's no built-in way to run several nodes as one cluster, no automatic routing between nodes, and no data replication. What it *does* give you is a clean seam where a distributed setup could be built on top, without touching the networking code.
 
-`internal/network` only parses the wire frame and hands it to `app.HandleMessage(...)` — it has no opinion on where a recipient lives. The shipped `domains.Relayer` resolves recipients through a local in-memory registry, but that's a policy choice made inside `HandleMessage`, not something `internal/core`, `internal/network`, or `internal/server` assume. A cluster-aware `App` can look up a local connector first and forward to another node for everything else, reusing the existing `core.ExtractTargets`/`core.DeliverTo` primitives for the local case, without touching any other layer.
+Here's why that seam exists: `internal/network` only parses the incoming bytes and hands the parsed message to `app.HandleMessage(...)`. It has no opinion on where the recipient actually lives. The relay logic that ships with this server (`domains.Relayer`) happens to look recipients up in a local, in-memory map — but that's a choice made inside `HandleMessage`, not something baked into the lower layers. If you wanted a cluster-aware version, you could write an `App` that checks the local registry first and forwards to another node otherwise, reusing the same `core.ExtractTargets`/`core.DeliverTo` building blocks for the local case, without changing anything else in the server.
 
-That seam does not include cluster membership, an ownership directory, inter-node transport, consensus/replication, or cluster-wide metrics — those are left to whatever distributed `App` you build, along with the usual distributed-systems problems (stale ownership, duplicate/out-of-order delivery, node failure mid-route, backpressure across nodes). See [Architecture.md §7](Architecture.md#7-distributed-deployment-extensibility) for the full breakdown.
+That seam does *not* include the hard parts of running a cluster: knowing which nodes exist, an ownership directory (which node owns which pubkey), the network transport between nodes, consensus/replication, or metrics that span the whole cluster. Those are all left for whoever builds the distributed `App`, along with the usual distributed-systems headaches (stale ownership info, duplicate or out-of-order delivery, a node dying mid-route, backpressure between nodes). See [Architecture.md §7](Architecture.md#7-distributed-deployment-extensibility) for the full picture.
 
 ## License
 
