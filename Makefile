@@ -48,7 +48,7 @@ build: check-jemalloc deps | bin
 	@echo "Built $(BINARY)"
 
 build-aarch64: deps | bin
-	@echo "Building $(BINARY) for aarch64 (linux/arm64)..."
+	@echo "Building $(BINARY) for aarch64 (linux/arm64) on amd (No CGO)..."
 	GOOS=linux GOARCH=arm64 go build -o bin/relayer-aarch64 ./cmd/relayer
 	@echo "Built bin/relayer-aarch64"
 
