@@ -12,10 +12,14 @@ type App interface {
 	// connection, before its read/write loop starts.
 	OnConnect(pubKey [32]byte, c Connector)
 
-	// OnDisconnect removes the connector previously registered under pubKey.
-	// Called once per connection when its read/write loop exits, regardless
-	// of whether it exited cleanly or due to an error.
-	OnDisconnect(pubKey [32]byte)
+	// OnDisconnect removes c from the registry, but only if c is still the
+	// connector currently registered under pubKey - a reconnect under the
+	// same pubKey replaces the registry entry (see OnConnect) without
+	// closing the old connector, so the old connector's own eventual
+	// OnDisconnect must not evict the newer one it was replaced by. Called
+	// once per connection when its read/write loop exits, regardless of
+	// whether it exited cleanly or due to an error.
+	OnDisconnect(pubKey [32]byte, c Connector)
 
 	// HandleMessage is called once per successfully framed inbound message
 	// (wire framing is already parsed by internal/network). The App owns the
