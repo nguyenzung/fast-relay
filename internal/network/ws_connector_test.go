@@ -67,7 +67,7 @@ type fakeApp struct {
 
 func (a *fakeApp) OnConnect(pubKey [32]byte, c core.Connector) {}
 
-func (a *fakeApp) OnDisconnect(pubKey [32]byte) {
+func (a *fakeApp) OnDisconnect(pubKey [32]byte, c core.Connector) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.disconnected = append(a.disconnected, pubKey)

@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +17,7 @@ import (
 // It uses sync.Map for lock-free reads and atomic counters for high-performance metrics.
 type Relayer struct {
 	connectors sync.Map
+	connCount  atomic.Int64  // mirrors len(connectors); avoids an O(n) Range in Count
 	processed  atomic.Uint64 // total messages received by the relayer
 	delivered  atomic.Uint64 // total messages successfully pushed to target connections
 	noRecip    atomic.Uint64 // messages dropped because no recipient was found
@@ -127,16 +128,26 @@ func (r *Relayer) FetchMetrics() any {
 	}
 }
 
-// OnConnect adds a connector into the global registry.
+// OnConnect adds a connector into the global registry. connCount is only
+// bumped when pubKey wasn't already registered, so a reconnect under the
+// same key (which overwrites the old entry) doesn't overcount.
 func (r *Relayer) OnConnect(pubKey [32]byte, c core.Connector) {
 	r.logger.Debug("Registering connector", "pub", pubKey)
-	r.connectors.Store(pubKey, c)
+	if _, loaded := r.connectors.Swap(pubKey, c); !loaded {
+		r.connCount.Add(1)
+	}
 }
 
-// OnDisconnect removes a connector from the global registry.
-func (r *Relayer) OnDisconnect(pubKey [32]byte) {
+// OnDisconnect removes c from the global registry, but only if c is still
+// the connector registered under pubKey. A reconnect under the same pubKey
+// replaces the entry in OnConnect without closing the old connector, so the
+// old connector's own (later) OnDisconnect must not evict the newer one it
+// was replaced by.
+func (r *Relayer) OnDisconnect(pubKey [32]byte, c core.Connector) {
 	r.logger.Debug("Unregistering connector", "pub", pubKey)
-	r.connectors.Delete(pubKey)
+	if r.connectors.CompareAndDelete(pubKey, c) {
+		r.connCount.Add(-1)
+	}
 }
 
 // GetConnectorByKey returns the Connector registered under pubKey.
@@ -150,12 +161,7 @@ func (r *Relayer) GetConnectorByKey(pubKey [32]byte) (core.Connector, bool) {
 
 // Count returns the approximate number of registered connectors.
 func (r *Relayer) Count() int {
-	count := 0
-	r.connectors.Range(func(k, v interface{}) bool {
-		count++
-		return true
-	})
-	return count
+	return int(r.connCount.Load())
 }
 
 // HandleMessage implements core.App: it is the default targeted-multicast
@@ -255,7 +261,7 @@ func (r *Relayer) LatencySnapshot() (count uint64, meanMs float64, stdMs float64
 	if len(samplesCopy) == 0 {
 		return count, meanMs, stdMs, 0, 0, 0
 	}
-	sort.Slice(samplesCopy, func(i, j int) bool { return samplesCopy[i] < samplesCopy[j] })
+	slices.Sort(samplesCopy)
 	n := float64(len(samplesCopy))
 	quantile := func(q float64) float64 {
 		// q in (0,1)

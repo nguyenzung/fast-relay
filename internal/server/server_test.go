@@ -39,7 +39,7 @@ func (a *fakeApp) OnConnect(pubKey [32]byte, c core.Connector) {
 	a.connect = append(a.connect, pubKey)
 }
 
-func (a *fakeApp) OnDisconnect(pubKey [32]byte) {
+func (a *fakeApp) OnDisconnect(pubKey [32]byte, c core.Connector) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.disconnect = append(a.disconnect, pubKey)

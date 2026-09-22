@@ -194,11 +194,11 @@ func readMessageWithFixedFromID(r io.Reader, maxDataLen int, fromID [32]byte) (*
 func hasDuplicateTarget(toIDs []byte, n int) bool {
 	const idSize = 32
 
-	for i := 0; i < n-1; i++ {
-		a := toIDs[i*idSize : (i+1)*idSize]
+	for i, off := 0, 0; i < n-1; i, off = i+1, off+idSize {
+		a := toIDs[off : off+idSize]
 
-		for j := i + 1; j < n; j++ {
-			if bytes.Equal(a, toIDs[j*idSize:(j+1)*idSize]) {
+		for j, off2 := i+1, off+idSize; j < n; j, off2 = j+1, off2+idSize {
+			if bytes.Equal(a, toIDs[off2:off2+idSize]) {
 				return true
 			}
 		}
@@ -209,7 +209,7 @@ func hasDuplicateTarget(toIDs []byte, n int) bool {
 // ReadWriteLoop is the primary pump. It handles binary protocol parsing and relaying.
 func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 	defer c.Close()
-	defer c.app.OnDisconnect(c.pubKey)
+	defer c.app.OnDisconnect(c.pubKey, c)
 
 	go func(app core.App) {
 		for msg := range c.outChan {
@@ -246,9 +246,15 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 		}
 
 		buf, err := readMessageWithFixedFromID(r, core.MaxMessageSize, c.pubKey)
+		if err == nil {
+			// recvTime captured after full message is in memory — equivalent to conn.Read() semantics.
+			recvTime := time.Now()
+			// nTo already validated (1..core.MaxTargetsPerMessage) inside readMessageWithFixedFromID.
+			c.app.HandleMessage(c, core.OutMessage{RecvTime: recvTime, Buf: buf})
+			buf.Release()
+			continue
+		}
 
-		// recvTime captured after full message is in memory — equivalent to conn.Read() semantics.
-		recvTime := time.Now()
 		switch {
 		case errors.Is(err, errSkipMessage):
 			continue
@@ -258,12 +264,8 @@ func (c *WSConnector) ReadWriteLoop(ctx context.Context) error {
 		case errors.Is(err, ErrInvalidMessage):
 			_ = c.conn.Close(websocket.StatusUnsupportedData, "invalid message")
 			return err
-		case err != nil:
+		default:
 			return err
 		}
-
-		// nTo already validated (1..core.MaxTargetsPerMessage) inside readMessageWithFixedFromID.
-		c.app.HandleMessage(c, core.OutMessage{RecvTime: recvTime, Buf: buf})
-		buf.Release()
 	}
 }
