@@ -57,6 +57,47 @@ func buildOutMessage(t *testing.T, fromID [32]byte, toIDs [][32]byte, payload []
 	return core.OutMessage{RecvTime: time.Now(), Buf: buf}
 }
 
+// TestOnDisconnect_StaleConnectorDoesNotEvictReplacement is a regression
+// test for the reconnect-identity/count invariant added in OnDisconnect:
+// when a pubKey is re-registered under a new connector, the old connector's
+// (later) OnDisconnect must not evict the new one or double-decrement the
+// count.
+func TestOnDisconnect_StaleConnectorDoesNotEvictReplacement(t *testing.T) {
+	r := relayer.NewRelayer()
+	pubKey := idFor(0xAA)
+
+	connA := &fakeConnector{id: pubKey}
+	connB := &fakeConnector{id: pubKey}
+
+	r.OnConnect(pubKey, connA)
+	if got := r.Count(); got != 1 {
+		t.Fatalf("Count() after connA registered = %d, want 1", got)
+	}
+
+	r.OnConnect(pubKey, connB)
+	if got := r.Count(); got != 1 {
+		t.Fatalf("Count() after connB replaces connA = %d, want 1", got)
+	}
+
+	// Stale disconnect for the replaced connector must not evict connB.
+	r.OnDisconnect(pubKey, connA)
+	if got := r.Count(); got != 1 {
+		t.Fatalf("Count() after stale OnDisconnect(connA) = %d, want 1", got)
+	}
+	if got, ok := r.GetConnectorByKey(pubKey); !ok || got != core.Connector(connB) {
+		t.Fatalf("GetConnectorByKey(pubKey) = %v, %v; want connB, true", got, ok)
+	}
+
+	// Disconnecting the current connector evicts it and decrements the count.
+	r.OnDisconnect(pubKey, connB)
+	if got := r.Count(); got != 0 {
+		t.Fatalf("Count() after OnDisconnect(connB) = %d, want 0", got)
+	}
+	if _, ok := r.GetConnectorByKey(pubKey); ok {
+		t.Fatalf("GetConnectorByKey(pubKey) found a connector after disconnect, want none")
+	}
+}
+
 // TestHandleMessage_RelaysBufferedFromIDUnchanged is a regression test for
 // where FromID trust now lives: network.readMessageWithFixedFromID is the
 // only place that ever writes FromID, so by the time HandleMessage runs,
